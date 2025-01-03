@@ -4,13 +4,15 @@
 flagcxResult_t flagcxCollectClusterInfos(const flagcxVendor *allData,
                                          flagcxCommunicatorType_t &type,
                                          int *homo_rank, int *homo_root_rank, int *homo_ranks,
-                                         int *hetero_rank, int *hetero_root_rank, int *hetero_ranks,
-                                         int *cluster_id, int rank, int nranks)
+                                         int *cluster_id, int *cluster_inter_rank, int *ncluster,
+                                         int rank, int nranks)
 {
     *homo_rank = rank;
     *homo_root_rank = 0;
     *homo_ranks = 1;
     *cluster_id = 0;
+    *cluster_inter_rank = -1;
+    *ncluster = 1;
     type = flagcxCommunicatorHomo;
 
     if (nranks <= 1)
@@ -63,8 +65,6 @@ flagcxResult_t flagcxCollectClusterInfos(const flagcxVendor *allData,
 
     if (type == flagcxCommunicatorHybrid)
     {
-        // we do not support for intermediate transfer (src rank -> intra-cluster proxy rank -> net) for now
-        // hetero_rank, hetero_ranks, hetero_root_rank are invalid
         const char *useDev = flagcxGetEnv("FLAGCX_USEDEV");
         int useDev_;
         if (useDev == NULL)
@@ -79,14 +79,10 @@ flagcxResult_t flagcxCollectClusterInfos(const flagcxVendor *allData,
         deviceAdaptor->getDevice(&currDev);
         if (currDev == useDev_)
         {
-            *hetero_rank = currCluster;
-            if (currCluster == 0)
-            {
-                *hetero_root_rank = rank;
-            }
-            *hetero_ranks = clusterMap.size();
+            *cluster_inter_rank = rank;
         }
         *cluster_id = currCluster;
+        *ncluster = numClusters;
     }
 
     return flagcxSuccess;
