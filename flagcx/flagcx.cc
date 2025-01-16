@@ -680,7 +680,8 @@ flagcxResult_t flagcxAllGather(const void *sendbuff, void *recvbuff, size_t send
     else
     {
         char* useBootstrap = getenv("USE_BOOTSTRAP_CCL");
-        if (useBootstrap) {
+        if (useBootstrap)
+	{
             return wrapperAllGatherBootstrap(sendbuff, recvbuff, sendcount, datatype, comm, stream);
         }
         if (has_host_comm())
@@ -733,6 +734,46 @@ flagcxResult_t flagcxAllGather(const void *sendbuff, void *recvbuff, size_t send
     return flagcxSuccess;
 }
 
+// A wrapper over AlltoAllBootstrap.
+// TODO: consider move to another place.
+flagcxResult_t wrapperAlltoAllBootstrap(const void* sendbuff, void* recvbuff, size_t count,
+                                        flagcxDataType_t datatype, flagcxComm_t comm, flagcxStream_t stream) {
+  uint64_t timers[TIMERS_COLL_COUNT] = {0};
+  timers[TIMER_COLL_TOTAL] = clockNano();
+
+  // step 1: alloc sendbuffer and copy from GPU memory to Host memory
+  timers[TIMER_COLL_MEM_D2H] = clockNano();
+  size_t databytes = count * getFlagcxDataTypeSize(datatype) * comm->nranks;
+  char *sbuff = nullptr;
+  FLAGCXCHECK(flagcxCalloc(&sbuff, databytes));
+  wrapper_deviceMemcpy(sbuff, const_cast<void *>(sendbuff), databytes, flagcxMemcpyDeviceToHost, stream);
+
+  // step 2: wait until memcpy done.
+  deviceAdaptor->streamSynchronize(stream);
+  timers[TIMER_COLL_MEM_D2H] = clockNano() - timers[TIMER_COLL_MEM_D2H];
+
+  // step 3: start the alltoall primitive via bootstrap
+  // use in-place version
+  timers[TIMER_COLL_COMM] = clockNano();
+  flagcxResult_t res = AlltoAllBootstrap(comm->bootstrap, (void *)(sbuff), (void *)(sbuff), count, datatype);
+  timers[TIMER_COLL_COMM] = clockNano() - timers[TIMER_COLL_COMM];
+
+  // step 4: copy data back to GPU memory
+  timers[TIMER_COLL_MEM_H2D] = clockNano();
+  wrapper_deviceMemcpy(recvbuff, (void *)sbuff, databytes, flagcxMemcpyHostToDevice, stream);
+
+  // For now, use synchronized way to free the buffer
+  deviceAdaptor->streamSynchronize(stream);
+  free(sbuff);
+  timers[TIMER_COLL_MEM_H2D] = clockNano() - timers[TIMER_COLL_MEM_H2D];
+  timers[TIMER_COLL_TOTAL] = clockNano() - timers[TIMER_COLL_TOTAL];
+  INFO(FLAGCX_COLL,
+       "Flagcx timings - %s: rank %d nranks %d total %.2fms (memory d2h %.2fms, memory h2d %.2fms, comm %.2fms)",
+       "wrapperAlltoAllBootstrap", comm->rank, comm->nranks,
+       timers[TIMER_COLL_TOTAL] / 1e6, timers[TIMER_COLL_MEM_D2H] / 1e6, timers[TIMER_COLL_MEM_H2D] / 1e6, timers[TIMER_COLL_COMM] / 1e6);
+  return res;
+}
+
 flagcxResult_t flagcxAlltoAll(const void *sendbuff, void *recvbuff, size_t count,
                               flagcxDataType_t datatype, flagcxComm_t comm, flagcxStream_t stream)
 {
@@ -742,6 +783,11 @@ flagcxResult_t flagcxAlltoAll(const void *sendbuff, void *recvbuff, size_t count
     }
     else
     {
+        char* useBootstrap = getenv("USE_BOOTSTRAP_CCL");
+        if (useBootstrap)
+	{
+            return wrapperAlltoAllBootstrap(sendbuff, recvbuff, count, datatype, comm, stream);
+        }
         if (has_host_comm())
         {
             void *buff_in;
