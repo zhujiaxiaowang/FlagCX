@@ -1,5 +1,6 @@
 #include "backend_flagcx.hpp"
 #include <iostream>
+#include <c10/core/DeviceGuard.h>
 
 namespace c10d
 {
@@ -254,14 +255,19 @@ namespace c10d
 
     void BackendFlagcx::groupStart()
     {
-        // flagcxGroupStart();
-        // ++flagcxActiveGroupCounter_;
+#if defined(USE_NVIDIA_ADAPTOR) || defined(USE_ILUVATAR_COREX_ADAPTOR)
+        initComm(c10::impl::getDeviceGuardImpl(at::DeviceType::CUDA)->getDevice());
+#elif defined(USE_CAMBRICON_ADAPTOR)
+        initComm(c10::impl::getDeviceGuardImpl(at::DeviceType::PrivateUse1)->getDevice());
+#endif
+        flagcxGroupStart();
+        ++flagcxActiveGroupCounter_;
     }
 
     void BackendFlagcx::groupEnd()
     {
-        // flagcxGroupEnd();
-        // --flagcxActiveGroupCounter_;
+        flagcxGroupEnd();
+        --flagcxActiveGroupCounter_;
     }
 
     void BackendFlagcx::startCoalescing()
