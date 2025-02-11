@@ -61,30 +61,26 @@ int main(int argc, char *argv[]){
         }
         for (int r = begin_root; r <= end_root; r++) {
             count = size / sizeof(float);
-            devHandle->deviceMalloc(&recvbuff, size, flagcxMemDevice);
+            devHandle->deviceMalloc(&sendbuff, size / totalProcs, flagcxMemDevice);
             devHandle->deviceMalloc(&hello, size, flagcxMemHost);
             devHandle->deviceMemset(hello, 0, size, flagcxMemHost, NULL);
 
-            for (size_t i = 0; i < count; i++) {
-                ((float *)hello)[i] = i % 10;
-            }
+            ((float *)hello)[0] = proc;
+
+            devHandle->deviceMemcpy(sendbuff, hello, size / totalProcs, flagcxMemcpyHostToDevice, NULL);
 
             if (proc == r) {
-                devHandle->deviceMalloc(&sendbuff, size, flagcxMemDevice);
-                devHandle->deviceMemcpy(sendbuff, hello, size, flagcxMemcpyHostToDevice, NULL);
+                devHandle->deviceMalloc(&recvbuff, size, flagcxMemDevice);
             }
 
             if (proc == 0 && print_buffer) {
                 printf("root rank is %d\n", r);
                 printf("sendbuff = ");
-                for (size_t i = 0; i < 10; i++) {
-                    printf("%f ", ((float *)hello)[i]);
-                }
-                printf("\n");
+                printf("%f\n", ((float *)hello)[0]);
             }
 
             for (int i = 0 ; i < num_warmup_iters; i++) {
-                flagcxBroadcast(sendbuff, recvbuff, count, DATATYPE, r, comm, stream);
+                flagcxGather(sendbuff, recvbuff, count / totalProcs, DATATYPE, r, comm, stream);
             }
             devHandle->streamSynchronize(stream);
 
@@ -92,7 +88,7 @@ int main(int argc, char *argv[]){
 
             tim.reset();
             for (int i = 0; i < num_iters; i++) {
-                flagcxBroadcast(sendbuff, recvbuff, count, DATATYPE, r, comm, stream);
+                flagcxGather(sendbuff, recvbuff, count / totalProcs, DATATYPE, r, comm, stream);
             }
             devHandle->streamSynchronize(stream);
             
@@ -101,27 +97,28 @@ int main(int argc, char *argv[]){
             double elapsed_time = tim.elapsed() / num_iters;
             double base_bw = (double)(size) / 1.0E9 / elapsed_time;
             double alg_bw = base_bw;
-            double factor = 1;
+            double factor = ((double)(totalProcs - 1)) / ((double)(totalProcs));
             double bus_bw = base_bw * factor;
             sum_alg_bw += alg_bw;
             sum_bus_bw += bus_bw;
             sum_time += elapsed_time;
             test_count++;
 
-            devHandle->deviceMemset(hello, 0, size, flagcxMemHost, NULL);
-            devHandle->deviceMemcpy(hello, recvbuff, size, flagcxMemcpyDeviceToHost, NULL);
-            if (proc == 0 && print_buffer) {
-                printf("recvbuff = ");
-                for (size_t i = 0; i < 10; i++) {
-                    printf("%f ", ((float *)hello)[i]);
-                }
-                printf("\n");
-            }
-
             if (proc == r) {
-                devHandle->deviceFree(sendbuff, flagcxMemDevice);
+                devHandle->deviceMemset(hello, 0, size, flagcxMemHost, NULL);
+                devHandle->deviceMemcpy(hello, recvbuff, size, flagcxMemcpyDeviceToHost, NULL);
+                if (print_buffer)
+                {
+                    printf("recvbuff = ");
+                    for (int i = 0; i < totalProcs; i++) {
+                        printf("%f ", ((float *)hello)[i * (count / totalProcs)]);
+                    }
+                    printf("\n");
+                }
+            
+                devHandle->deviceFree(recvbuff, flagcxMemDevice);
             }
-            devHandle->deviceFree(recvbuff, flagcxMemDevice);
+            devHandle->deviceFree(sendbuff, flagcxMemDevice);
             devHandle->deviceFree(hello, flagcxMemHost);
         }
         if (proc == 0) {

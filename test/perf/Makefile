@@ -17,7 +17,7 @@ EXTRA_COMPILER_FLAG = -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -
 INCLUDEDIR := $(abspath include)
 LIBSRCFILES:= $(wildcard *.cc)
 
-all: test-sendrecv test-allreduce test-allgather test-reducescatter test-alltoall test-broadcast test-core-sendrecv
+all: test-sendrecv test-allreduce test-allgather test-reducescatter test-alltoall test-broadcast test-gather test-scatter test-core-sendrecv
 
 test-sendrecv: test_sendrecv.cpp
 	@echo "Compiling $@"
@@ -43,6 +43,14 @@ test-broadcast: test_broadcast.cpp
 	@echo "Compiling $@"
 	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_broadcast test_broadcast.cpp $(LIBSRCFILES) -I../../flagcx/include -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -L../../build/lib -L$(MPI_LIB) -lflagcx $(MPI_LINK)
 
+test-gather: test_gather.cpp
+	@echo "Compiling $@"
+	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_gather test_gather.cpp $(LIBSRCFILES) -I../../flagcx/include -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -L../../build/lib -L$(MPI_LIB) -lflagcx $(MPI_LINK)
+
+test-scatter: test_scatter.cpp
+	@echo "Compiling $@"
+	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_scatter test_scatter.cpp $(LIBSRCFILES) -I../../flagcx/include -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -L../../build/lib -L$(MPI_LIB) -lflagcx $(MPI_LINK)
+
 test-core-sendrecv: test_core_sendrecv.cpp
 	@echo "Compiling $@"
 	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_core_sendrecv test_core_sendrecv.cpp $(LIBSRCFILES) -I../../flagcx/include -I../../flagcx/service -I../../flagcx/core -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -L../../build/lib/ -L$(MPI_LIB) -lflagcx $(MPI_LINK)
@@ -54,6 +62,8 @@ clean:
 	@rm -f test_reducescatter
 	@rm -f test_alltoall
 	@rm -f test_broadcast
+	@rm -f test_gather
+	@rm -f test_scatter
 	@rm -f test_core_sendrecv
 
 run-sendrecv:
