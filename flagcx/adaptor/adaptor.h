@@ -1,5 +1,6 @@
 #ifndef FLAGCX_ADAPTOR_H_
 #define FLAGCX_ADAPTOR_H_
+#include "topo.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -142,7 +143,8 @@ struct flagcxDeviceAdaptor {
   // Others
   // TODO: this one shall be moved into Flagcx Core Topology APIs
   // Here we only define several low-level APIs required by topology detection
-  flagcxResult_t (*topoGetSystem)(void *topoArgs, void **system);
+  flagcxResult_t (*getDeviceProperties)(struct flagcxDevProps *props, int dev);
+  flagcxResult_t (*getDevicePciBusId)(char *pciBusId, int len, int dev);
 
   // HostFunc launch
   flagcxResult_t (*launchHostFunc)(flagcxStream_t stream, void (*fn)(void *),
