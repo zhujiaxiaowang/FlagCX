@@ -9,6 +9,7 @@ std::map<flagcxDataType_t, cnclDataType_t> f2c_datatype_map = {
     {flagcxInt64, cnclInt64},     {flagcxHalf, cnclHalf},
     {flagcxFloat16, cnclFloat16}, {flagcxBfloat16, cnclBfloat16},
     {flagcxFloat32, cnclFloat32}, {flagcxFloat, cnclFloat},
+    {flagcxDouble, cnclFloat},
 };
 
 std::map<flagcxRedOp_t, cnclReduceOp_t> f2c_reduceop_map = {
@@ -57,9 +58,8 @@ flagcxResult_t cnclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
   if (*comm == NULL) {
     flagcxCalloc(comm, 1);
   }
-  unsigned int device_count = 0;
-  DEVCHECK(cnrtGetDeviceCount(&device_count));
-  int dev_id = rank % device_count;
+  int dev_id = 0;
+  DEVCHECK(cnrtGetDevice(&dev_id));
   return (flagcxResult_t)c2f_ret_map[cnclInitComms(
       &(*comm)->base, 1 /*num_comm*/, &dev_id /*dev_list*/, &rank /*rank_list*/,
       nranks, (cnclCliqueId *)commId)];
@@ -254,7 +254,7 @@ flagcxResult_t cnclAdaptorAlltoAllv(const void *sendbuff, size_t *sendcounts,
   res = cnclGroupStart();
   for (int r = 0; r < nranks; r++) {
     if (flagcxCCLAdaptorNeedSendrecv(sendcounts[r])) {
-      res = cnclSend(static_cast<const void *>(buffer_in + sdispls[r] * size),
+      res = cnclSend(const_cast<void *>(static_cast<const void *>(buffer_in + sdispls[r] * size)),
                      sendcounts[r], f2c_datatype_map[datatype], r, comm->base,
                      stream->base);
     }
