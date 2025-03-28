@@ -1,0 +1,48 @@
+# .github/workflows/test.yml
+name: Run Container and Execute Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test-in-container:
+    runs-on: self-hosted
+    container:
+      image: localhost:5000/flagscale:cuda-12.4.1-python-3.12-torch-2.5.1-commit-e05f659
+      options: --gpus all --privileged --ipc=host --ulimit memlock=-1 --ulimit stack=67108864
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          ssh-strict: true
+          ssh-user: git
+          persist-credentials: true
+          clean: true
+          sparse-checkout-cone-mode: true
+          fetch-tags: false
+          show-progress: true
+          lfs: false
+          submodules: false
+          set-safe-directory: true
+
+      - name: Check the current working directory
+        run: |
+          echo "Current directory: $(pwd)"
+          ls -l ./test/script
+
+      - name: Ensure script has execute permissions
+        run: chmod +x /__w/FlagCX/FlagCX/test/script/auto_script.sh
+
+      - name: Run Auto Test Script in Container
+        run: |
+          cd /__w/FlagCX/FlagCX
+          ./test/script/auto_script.sh
+
+
