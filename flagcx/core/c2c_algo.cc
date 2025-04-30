@@ -194,29 +194,29 @@ void flagcxInterRankBufferInfoManager::printBufferInfo(int step) {
       for (auto bufferIt = rankIt->second.begin();
            bufferIt != rankIt->second.end(); ++bufferIt) {
         if (step == 0) {
-          INFO(FLAGCX_COLL,
-               "Initial InterRankBufferInfo: cluster_id = %d, rank = %d, "
-               "offset = %d, count = %d, clusterIdToSend = %d, "
-               "isRecv = %d, isScheduled = %d, peerRank = %d, loopId = %d",
-               clusterIt->first, rankIt->first, bufferIt->offset_,
-               bufferIt->count_, bufferIt->clusterIdToSend_, bufferIt->isRecv_,
-               bufferIt->isScheduled_, bufferIt->peerRank_, bufferIt->loopId_);
+          TRACE_CALL(
+              "Initial InterRankBufferInfo: cluster_id = %d, rank = %d, "
+              "offset = %d, count = %d, clusterIdToSend = %d, "
+              "isRecv = %d, isScheduled = %d, peerRank = %d, loopId = %d",
+              clusterIt->first, rankIt->first, bufferIt->offset_,
+              bufferIt->count_, bufferIt->clusterIdToSend_, bufferIt->isRecv_,
+              bufferIt->isScheduled_, bufferIt->peerRank_, bufferIt->loopId_);
         } else if (step == 1) {
-          INFO(FLAGCX_COLL,
-               "Internal InterRankBufferInfo: cluster_id = %d, rank = %d, "
-               "offset = %d, count = %d, clusterIdToSend = %d, "
-               "isRecv = %d, isScheduled = %d, peerRank = %d, loopId = %d",
-               clusterIt->first, rankIt->first, bufferIt->offset_,
-               bufferIt->count_, bufferIt->clusterIdToSend_, bufferIt->isRecv_,
-               bufferIt->isScheduled_, bufferIt->peerRank_, bufferIt->loopId_);
+          TRACE_CALL(
+              "Internal InterRankBufferInfo: cluster_id = %d, rank = %d, "
+              "offset = %d, count = %d, clusterIdToSend = %d, "
+              "isRecv = %d, isScheduled = %d, peerRank = %d, loopId = %d",
+              clusterIt->first, rankIt->first, bufferIt->offset_,
+              bufferIt->count_, bufferIt->clusterIdToSend_, bufferIt->isRecv_,
+              bufferIt->isScheduled_, bufferIt->peerRank_, bufferIt->loopId_);
         } else if (step == 2) {
-          INFO(FLAGCX_COLL,
-               "Final InterRankBufferInfo: cluster_id = %d, rank = %d, "
-               "offset = %d, count = %d, clusterIdToSend = %d, "
-               "isRecv = %d, isScheduled = %d, peerRank = %d, loopId = %d",
-               clusterIt->first, rankIt->first, bufferIt->offset_,
-               bufferIt->count_, bufferIt->clusterIdToSend_, bufferIt->isRecv_,
-               bufferIt->isScheduled_, bufferIt->peerRank_, bufferIt->loopId_);
+          TRACE_CALL(
+              "Final InterRankBufferInfo: cluster_id = %d, rank = %d, "
+              "offset = %d, count = %d, clusterIdToSend = %d, "
+              "isRecv = %d, isScheduled = %d, peerRank = %d, loopId = %d",
+              clusterIt->first, rankIt->first, bufferIt->offset_,
+              bufferIt->count_, bufferIt->clusterIdToSend_, bufferIt->isRecv_,
+              bufferIt->isScheduled_, bufferIt->peerRank_, bufferIt->loopId_);
         }
       }
     }
@@ -231,10 +231,10 @@ flagcxC2cP2pOp::~flagcxC2cP2pOp() {}
 
 flagcxResult_t flagcxC2cP2pOp::run(void *buff, flagcxDataType_t datatype,
                                    flagcxComm_t comm, flagcxStream_t stream) {
-  INFO(FLAGCX_COLL,
-       "flagcxC2cP2pOp run: rank = %d, peerRank = %d, offset = %d, count = %d, "
-       "isRecv = %d, datatype = %d",
-       comm->rank, peerRank_, offset_, count_, isRecv_, datatype);
+  TRACE_CALL(
+      "flagcxC2cP2pOp run: rank = %d, peerRank = %d, offset = %d, count = %d, "
+      "isRecv = %d, datatype = %d",
+      comm->rank, peerRank_, offset_, count_, isRecv_, datatype);
   void *ptr =
       static_cast<char *>(buff) + offset_ * getFlagcxDataTypeSize(datatype);
   if (isRecv_) {
@@ -246,10 +246,11 @@ flagcxResult_t flagcxC2cP2pOp::run(void *buff, flagcxDataType_t datatype,
   }
 }
 
-flagcxC2cHomoFunc::flagcxC2cHomoFunc(int rootRank, int offset, int count,
+flagcxC2cHomoFunc::flagcxC2cHomoFunc(int rootRank, int sendOffset,
+                                     int recvOffset, int count,
                                      int isHomoInterComm, flagcxCommOp_t commOp)
-    : rootRank_(rootRank), offset_(offset), count_(count),
-      isHomoInterComm_(isHomoInterComm), commOp_(commOp) {}
+    : rootRank_(rootRank), sendOffset_(sendOffset), recvOffset_(recvOffset),
+      count_(count), isHomoInterComm_(isHomoInterComm), commOp_(commOp) {}
 
 flagcxC2cHomoFunc::~flagcxC2cHomoFunc() {}
 
@@ -261,43 +262,42 @@ flagcxResult_t flagcxC2cHomoFunc::run(const void *sendbuff, void *recvbuff,
   if (isHomoInterComm_ && comm->homoInterMyRank == -1) {
     return flagcxSuccess;
   }
-  INFO(
-      FLAGCX_COLL,
-      "flagcxC2cHomoFunc run: rank = %d, rootRank = %d, offset = %d, count = "
-      "%d, "
+  TRACE_CALL(
+      "flagcxC2cHomoFunc run: rank = %d, rootRank = %d, sendOffset = %d, "
+      "recvOffset = %d, count = %d, "
       "isHomoInterComm = %d, commOp = %d, datatype = %d, redOp = %d, root = %d",
-      comm->rank, rootRank_, offset_, count_, isHomoInterComm_, commOp_,
-      datatype, redOp, root);
+      comm->rank, rootRank_, sendOffset_, recvOffset_, count_, isHomoInterComm_,
+      commOp_, datatype, redOp, root);
   switch (commOp_) {
     case flagcxCommOpReduce:
       return cclAdaptors[flagcxCCLAdaptorDevice]->reduce(
           const_cast<const void *>(static_cast<void *>(
               static_cast<char *>(const_cast<void *>(sendbuff)) +
-              offset_ * getFlagcxDataTypeSize(datatype))),
+              sendOffset_ * getFlagcxDataTypeSize(datatype))),
           static_cast<void *>(static_cast<char *>(recvbuff) +
-                              offset_ * getFlagcxDataTypeSize(datatype)),
+                              recvOffset_ * getFlagcxDataTypeSize(datatype)),
           count_, datatype, redOp, (rootRank_ == -1) ? root : rootRank_,
           isHomoInterComm_ ? comm->homoInterComm : comm->homo_comm, stream);
     case flagcxCommOpAllReduce:
       return cclAdaptors[flagcxCCLAdaptorDevice]->allReduce(
           const_cast<const void *>(static_cast<void *>(
               static_cast<char *>(const_cast<void *>(sendbuff)) +
-              offset_ * getFlagcxDataTypeSize(datatype))),
+              sendOffset_ * getFlagcxDataTypeSize(datatype))),
           static_cast<void *>(static_cast<char *>(recvbuff) +
-                              offset_ * getFlagcxDataTypeSize(datatype)),
+                              recvOffset_ * getFlagcxDataTypeSize(datatype)),
           count_, datatype, redOp,
           isHomoInterComm_ ? comm->homoInterComm : comm->homo_comm, stream);
     case flagcxCommOpReduceScatter:
       return cclAdaptors[flagcxCCLAdaptorDevice]->reduceScatter(
           const_cast<const void *>(static_cast<void *>(
               static_cast<char *>(const_cast<void *>(sendbuff)) +
-              offset_ * getFlagcxDataTypeSize(datatype))),
+              sendOffset_ * getFlagcxDataTypeSize(datatype))),
           static_cast<void *>(
               static_cast<char *>(recvbuff) +
-              (offset_ + count_ *
-                             (isHomoInterComm_ ? comm->homoInterMyRank
-                                               : comm->homo_rank) *
-                             getFlagcxDataTypeSize(datatype))),
+              (recvOffset_ + count_ *
+                                 (isHomoInterComm_ ? comm->homoInterMyRank
+                                                   : comm->homo_rank) *
+                                 getFlagcxDataTypeSize(datatype))),
           count_, datatype, redOp,
           isHomoInterComm_ ? comm->homoInterComm : comm->homo_comm, stream);
     default:
@@ -348,9 +348,11 @@ flagcxResult_t flagcxC2cRefreshFunc::run(void *buff, flagcxDataType_t datatype,
   return flagcxSuccess;
 }
 
-flagcxC2cPlanner::flagcxC2cPlanner(int totalCount, flagcxComm_t comm,
-                                   flagcxCommOp_t commOp, flagcxRedOp_t redOp)
-    : totalCount_(totalCount), comm_(comm), commOp_(commOp), redOp_(redOp),
+flagcxC2cPlanner::flagcxC2cPlanner(int totalCount, int recvCount,
+                                   flagcxComm_t comm, flagcxCommOp_t commOp,
+                                   flagcxRedOp_t redOp)
+    : totalCount_(totalCount), recvCount_(recvCount), comm_(comm),
+      commOp_(commOp), redOp_(redOp),
       clusterInterRankList_(comm->clusterInterRankList),
       interRankBufferInfoManager_(totalCount),
       clusterId_(comm->cluster_ids[comm->rank]), rank_(comm->rank),
@@ -358,11 +360,19 @@ flagcxC2cPlanner::flagcxC2cPlanner(int totalCount, flagcxComm_t comm,
       homoRanks_(comm->homo_ranks), homoInterMyRank_(comm->homoInterMyRank),
       homoInterRootRank_(comm->homoInterRootRank),
       homoInterRanks_(comm->homoInterRanks) {
-  // if inter ranks in all clusters equal to 1 （单网卡）
+  // if inter ranks in all clusters equal to 1 （single-nic）
   multiNic_ = 0;
   for (size_t i = 0; i < clusterInterRankList_.size(); ++i) {
     if (clusterInterRankList_[i].size() != 1) {
       multiNic_ = 1;
+      break;
+    }
+  }
+
+  // if inter ranks in a cluster is superier to totalCount_ (single-nic)
+  for (size_t i = 0; i < clusterInterRankList_.size(); ++i) {
+    if (clusterInterRankList_[i].size() > totalCount_) {
+      multiNic_ = 0;
       break;
     }
   }
@@ -375,20 +385,25 @@ flagcxC2cPlanner::flagcxC2cPlanner(int totalCount, flagcxComm_t comm,
       break;
     }
   }
+
+  // TODO: init scratch buffer
+  scratchBuffer_ = nullptr;
 }
 
-flagcxC2cPlanner::~flagcxC2cPlanner() {}
+flagcxC2cPlanner::~flagcxC2cPlanner() {
+  // TODO: destroy scratch buffer
+}
 
 flagcxResult_t flagcxC2cPlanner::refresh(int isSendRecv) {
   if (isSendRecv) {
     interRankBufferInfoManager_.resetBufferInfo();
+    size_t nClusterInterRanks = multiNic_ ? clusterInterRankList_.size() : 1;
     for (size_t i = 0; i < clusterInterRankList_.size(); ++i) {
-      int sendCount = totalCount_ / clusterInterRankList_[i].size();
-      int sendRes = totalCount_ % clusterInterRankList_[i].size();
-      for (size_t j = 0; j < clusterInterRankList_[i].size(); ++j) {
-        int finalCount = (j == clusterInterRankList_[i].size() - 1)
-                             ? sendCount + sendRes
-                             : sendCount;
+      int sendCount = totalCount_ / nClusterInterRanks;
+      int sendRes = totalCount_ % nClusterInterRanks;
+      for (size_t j = 0; j < nClusterInterRanks; ++j) {
+        int finalCount =
+            (j == nClusterInterRanks - 1) ? sendCount + sendRes : sendCount;
         for (size_t z = 0; z < clusterInterRankList_.size(); ++z) {
           if (i != z) {
             interRankBufferInfoManager_.pushBackBufferInfo(
@@ -448,7 +463,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
             interRankBufferInfoManager_.getBufferInfoList(clusterId_, rank_)
                 .front();
         if (preHomoFuncCommOp == flagcxCommOpReduceScatter) {
-          preHomoFuncList_.emplace_back(-1, 0, buffer.count_, 0,
+          preHomoFuncList_.emplace_back(-1, 0, 0, buffer.count_, 0,
                                         preHomoFuncCommOp);
         }
       }
@@ -462,9 +477,10 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                                clusterId_, clusterInterRankList_[clusterId_][i])
                            .front();
         if (preHomoFuncCommOp == flagcxCommOpReduce) {
-          preHomoFuncList_.emplace_back(
-              clusterInterRankList_[clusterId_][i] - (rank_ - homoMyRank_),
-              buffer.offset_, buffer.count_, 0, preHomoFuncCommOp);
+          preHomoFuncList_.emplace_back(clusterInterRankList_[clusterId_][i] -
+                                            (rank_ - homoMyRank_),
+                                        buffer.offset_, buffer.offset_,
+                                        buffer.count_, 0, preHomoFuncCommOp);
         }
       }
     }
@@ -682,7 +698,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
     flagcxCommOp_t homoInterFuncCommOp = getC2cHomoCommOp(commOp_, 1, 1);
     for (int i = 0; i < heteroAndHomoInterFuncLoops_; ++i) {
       if (homoInterFuncCommOp == flagcxCommOpAllReduce) {
-        homoInterFuncList_.emplace_back(-1, 0, totalCount_, 1,
+        homoInterFuncList_.emplace_back(-1, 0, 0, recvCount_, 1,
                                         homoInterFuncCommOp);
       }
     }
@@ -696,7 +712,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
     }
     for (int i = 0; i < postHomoFuncLoops_; ++i) {
       if (postHomoFuncCommOp == flagcxCommOpAllReduce) {
-        postHomoFuncList_.emplace_back(-1, 0, totalCount_, 0,
+        postHomoFuncList_.emplace_back(-1, 0, 0, recvCount_, 0,
                                        postHomoFuncCommOp);
       }
     }
@@ -711,9 +727,10 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                              clusterId_, clusterInterRankList_[clusterId_][i])
                          .front();
       if (preHomoFuncCommOp == flagcxCommOpReduce) {
-        preHomoFuncList_.emplace_back(
-            clusterInterRankList_[clusterId_][i] - (rank_ - homoMyRank_),
-            buffer.offset_, buffer.count_, 0, preHomoFuncCommOp);
+        preHomoFuncList_.emplace_back(clusterInterRankList_[clusterId_][i] -
+                                          (rank_ - homoMyRank_),
+                                      buffer.offset_, buffer.offset_,
+                                      buffer.count_, 0, preHomoFuncCommOp);
       }
     }
 
@@ -756,7 +773,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
     flagcxCommOp_t homoInterFuncCommOp = getC2cHomoCommOp(commOp_, 1, 2);
     for (int i = 0; i < heteroAndHomoInterFuncLoops_; ++i) {
       if (homoInterFuncCommOp == flagcxCommOpAllReduce) {
-        homoInterFuncList_.emplace_back(-1, 0, totalCount_, 1,
+        homoInterFuncList_.emplace_back(-1, 0, 0, recvCount_, 1,
                                         homoInterFuncCommOp);
       }
     }
@@ -766,7 +783,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
     postHomoFuncLoops_ = 1;
     for (int i = 0; i < postHomoFuncLoops_; ++i) {
       if (postHomoFuncCommOp == flagcxCommOpAllReduce) {
-        postHomoFuncList_.emplace_back(-1, 0, totalCount_, 0,
+        postHomoFuncList_.emplace_back(-1, 0, 0, recvCount_, 0,
                                        postHomoFuncCommOp);
       }
     }
