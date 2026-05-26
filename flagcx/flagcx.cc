@@ -163,7 +163,7 @@ flagcxResult_t flagcxHandleInit(flagcxHandlerGroup_t *handler) {
   (*handler) = NULL;
   FLAGCXCHECKGOTO(flagcxCalloc(handler, 1), res, fail);
   FLAGCXCHECKGOTO(flagcxCalloc(&(*handler)->uniqueId, 1), res, fail);
-  FLAGCXCHECKGOTO(flagcxCalloc(&(*handler)->comm, 1), res, fail);
+  // comm left NULL — allocated by flagcxCommInitRank
   FLAGCXCHECKGOTO(flagcxCalloc(&(*handler)->devHandle, 1), res, fail);
   *(*handler)->devHandle = globalDeviceHandle;
   return flagcxSuccess;
@@ -171,7 +171,6 @@ flagcxResult_t flagcxHandleInit(flagcxHandlerGroup_t *handler) {
 fail:
   if (*handler) {
     free((*handler)->uniqueId);
-    free((*handler)->comm);
     free((*handler)->devHandle);
     free(*handler);
     *handler = NULL;
@@ -183,8 +182,10 @@ fail:
 
 flagcxResult_t flagcxHandleFree(flagcxHandlerGroup_t handler) {
   if (handler != NULL) {
-    free(handler->uniqueId);
-    free(handler->devHandle);
+    if (handler->uniqueId)
+      free(handler->uniqueId);
+    if (handler->devHandle)
+      free(handler->devHandle);
     handler->uniqueId = NULL;
     handler->comm = NULL;
     handler->devHandle = NULL;
@@ -1180,8 +1181,10 @@ flagcxResult_t flagcxGetVersion(int *version) {
 }
 
 flagcxResult_t flagcxGetUniqueId(flagcxUniqueId_t *uniqueId) {
-  (*uniqueId) = NULL;
-  flagcxCalloc(uniqueId, 1);
+  // Allocate if caller passed a NULL pointer
+  if (*uniqueId == nullptr) {
+    FLAGCXCHECK(flagcxCalloc(uniqueId, 1));
+  }
 
   // Init bootstrap net
   FLAGCXCHECK(bootstrapNetInit());
@@ -1488,6 +1491,32 @@ static flagcxResult_t flagcxDevCommStateDestroy(flagcxComm_t comm) {
   return flagcxSuccess;
 }
 
+flagcxResult_t flagcxHomoCommInit(flagcxUniqueId_t commId,
+                                  flagcxUniqueId *uniqueIdData,
+                                  struct bootstrapState *state,
+                                  flagcxComm_t comm,
+                                  flagcxInnerComm_t *homoComm /*out*/) {
+  int rank = comm->rank;
+  int nranks = comm->nranks;
+  memset((void *)commId, 0, sizeof(*commId));
+  memset((void *)uniqueIdData, 0, nranks * sizeof(flagcxUniqueId));
+  if (comm->homoRank == 0) {
+    cclAdaptors[flagcxCCLAdaptorDevice]->getUniqueId(&commId);
+  }
+  if (comm->homoRank == 0) {
+    memcpy((void *)&uniqueIdData[rank], (void *)commId, sizeof(flagcxUniqueId));
+  }
+  FLAGCXCHECK(
+      bootstrapAllGather(state, (void *)uniqueIdData, sizeof(flagcxUniqueId)));
+  FLAGCXCHECK(bootstrapBarrier(state, rank, nranks, 0));
+
+  memcpy((void *)commId, (void *)&uniqueIdData[comm->homoRootRank],
+         sizeof(flagcxUniqueId));
+  FLAGCXCHECK(cclAdaptors[flagcxCCLAdaptorDevice]->commInitRank(
+      homoComm, comm->homoRanks, commId, comm->homoRank, NULL));
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
                                   flagcxUniqueId_t commId, int rank) {
   if (nranks < 1 || rank < 0 || rank >= nranks) {
@@ -1524,6 +1553,8 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
   (*comm)->homoInterComm = NULL;
   (*comm)->c2cSchedule = NULL;
   (*comm)->devCommState = NULL;
+  flagcxIntruQueueConstruct(&(*comm)->deferredBufferQueue);
+  (*comm)->deferredBufferCount = 0;
 
   struct bootstrapState *state = NULL;
   FLAGCXCHECK(flagcxCalloc(&state, 1));
@@ -1968,6 +1999,9 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
 
   // Clean up IPC peer pointer table — deferred to here.
   FLAGCXCHECK(flagcxCommCleanupIpcTable(comm));
+
+  // Drain deferred DevComm buffer queue.
+  FLAGCXCHECK(flagcxCommDrainDeferredBuffers(comm));
 
   // Drain deferred device/host-pinned memory frees,
   // collected during DevComm/DevMem cleanup.

@@ -5,6 +5,7 @@
 #include "dev_comm_state.h"
 #include "flagcx.h"
 #include "flagcx_tuner.h"
+#include "utils.h"
 
 #include <map>
 #include <vector>
@@ -32,6 +33,22 @@ struct flagcxIpcTableEntry {
 struct flagcxDeferredFree {
   void *ptr;
   int memType; // flagcxMemDevice, flagcxMemHost, etc.
+};
+
+// Deferred DevComm buffer handle — buffers that cannot be freed immediately
+// in flagcxDevCommDestroy because peers may still hold IPC mappings to them.
+// Drained at flagcxCommDestroy time.
+#define FLAGCX_MAX_DEFERRED_BUFFER_HANDLES 64
+
+struct flagcxDevCommBufferHandle {
+  void *localBarrierFlags;     // flagcxMemDevice — peers write via IPC
+  void *epochBuffer;           // flagcxMemDevice
+  void *signalBuffer;          // flagcxMemHost or flagcxMemDevice (GDR)
+  void *shadowBuffer;          // flagcxMemDevice
+  void *counterBuffer;         // flagcxMemHost
+  void *putValueStagingBuffer; // flagcxMemHost
+  int signalHostEnable; // mirrors flagcxParamSignalHostEnable() at alloc time
+  struct flagcxDevCommBufferHandle *next; // intrusive queue link
 };
 
 /* Opaque handle to flagcxHeteroComm */
@@ -93,6 +110,13 @@ struct flagcxComm {
   // IPC peer pointer table — deferred cleanup
   struct flagcxIpcTableEntry ipcTable[FLAGCX_MAX_IPC_ENTRIES];
 
+  // Deferred DevComm buffer queue — buffers stashed here during
+  // flagcxDevCommDestroy, drained at flagcxCommDestroy.
+  flagcxIntruQueue<struct flagcxDevCommBufferHandle,
+                   &flagcxDevCommBufferHandle::next>
+      deferredBufferQueue;
+  int deferredBufferCount;
+
   // Deferred device/host-pinned memory free list
   struct flagcxDeferredFree deferredFrees[FLAGCX_MAX_DEFERRED_FREES];
   int deferredFreeCount;
@@ -100,5 +124,13 @@ struct flagcxComm {
   // Custom op state (NULL = not enabled)
   struct flagcxDevCommState *devCommState;
 };
+
+// Function helps init single homo cluster.
+// return homoComm via homoComm parameter.
+flagcxResult_t flagcxHomoCommInit(flagcxUniqueId_t commId,
+                                  flagcxUniqueId *uniqueIdData,
+                                  struct bootstrapState *state,
+                                  flagcxComm_t comm,
+                                  flagcxInnerComm_t *homoComm /*out*/);
 
 #endif // end include guard

@@ -13,6 +13,7 @@
  *   -w <warmup>    -n <iters>     -p <printbuffer 0/1>
  ************************************************************************/
 
+#include "device_api.h"
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "tools.h"
@@ -94,9 +95,9 @@ int main(int argc, char *argv[]) {
     FLAGCXCHECK(flagcxMemAlloc(&regBuff, maxBytes));
   }
   if (localRegister == 2) {
-    // Window mode (NCCL > 2.28 only; graceful fallback on Default path)
+    // Window mode: either go on Vendor path or Default path
     FLAGCXCHECK(flagcxCommWindowRegister(comm, regBuff, maxBytes, &win,
-                                         FLAGCX_WIN_DEFAULT));
+                                         FLAGCX_WIN_COLL_SYMMETRIC));
     FLAGCXCHECK(flagcxDevMemCreate(comm, regBuff, maxBytes, win, &devMem));
   } else if (localRegister == 1) {
     // IPC mode: explicit NIC registration + implicit IPC peer exchange

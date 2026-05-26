@@ -1,68 +1,110 @@
 #*************************************************************************
 # Copyright (c) 2026 BAAI. All rights reserved.
+#
+# test/kernel/ — standalone MPI+GPU integration tests for FlagCX Device API.
+# Each test_*.cpp / test_*.cu produces a separate binary in build/bin/.
 #*************************************************************************
 
-MPI_HOME ?= /usr/local/mpi
-MPI_INCLUDE = $(MPI_HOME)/include
-MPI_LIB = $(MPI_HOME)/lib
-MPI_LINK = -lmpi
-COMPILER = g++
-EXTRA_COMPILER_FLAG = -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wl,-rpath,../../build/lib -std=c++11 -g
+include ../make.inc
 
-INCLUDEDIR := $(abspath ../include)
-LIBSRCFILES:= ../tools.cc
+# ---------------------------------------------------------------------------
+# CUDA / Device compiler (from make.inc device platform resolution)
+# ---------------------------------------------------------------------------
+PLATFORM_INCLUDES = -I$(PLATFORM_IR_DIR)
 
-DEVICE_HOME ?=
-DEVICE_LIB =
-DEVICE_INCLUDE =
-DEVICE_LINK =
-DEVICE_COMPILER =
+# Auto-detect GPU architectures (same as main Makefile)
 ifeq ($(USE_NVIDIA), 1)
-	DEVICE_HOME = /usr/local/cuda
-	DEVICE_LIB = $(DEVICE_HOME)/lib64 -L$(DEVICE_HOME)/lib64/stubs
-	DEVICE_INCLUDE = $(DEVICE_HOME)/include
-	DEVICE_LINK = -lcudart -lcuda
-	DEVICE_COMPILER = $(DEVICE_HOME)/bin/nvcc
-else ifeq ($(USE_DU), 1)
-        DEVICE_HOME = $(CUDA_PATH)
-        DEVICE_LIB = $(DEVICE_HOME)/lib64 -L$(DEVICE_HOME)/lib64/stubs
-        DEVICE_INCLUDE = $(DEVICE_HOME)/include
-        DEVICE_LINK = -lcudart -lcuda
-        DEVICE_COMPILER = $(DEVICE_HOME)/bin/nvcc
+include $(PROJECT_ROOT)/makefiles/nvidia_gencode.mk
 endif
 
-COMMON_INCLUDES = -I../../flagcx/include -I../../flagcx/adaptor/include -I../../flagcx/service/include -I../../flagcx/core/include -I../../third-party/json/single_include -I$(INCLUDEDIR) -I$(MPI_INCLUDE) -I$(DEVICE_INCLUDE)
-COMMON_LIBS = -L../../build/lib -L$(MPI_LIB) -L$(DEVICE_LIB) -lflagcx $(MPI_LINK) $(DEVICE_LINK)
+# ---------------------------------------------------------------------------
+# Include paths
+# ---------------------------------------------------------------------------
+# IR wrapper headers
+IR_INCLUDE := -I$(PROJECT_ROOT)/bindings/ir
 
-all: test-intranode test-internode-twosided test-internode-onesided test-device-api test-multi-fifo
+# Device API internal headers (device_api.h lives in this directory)
+LOCAL_INCLUDE := -I.
 
-test-intranode: test_intranode.cpp
-	@echo "Compiling $@"
-	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_intranode test_intranode.cpp $(LIBSRCFILES) $(COMMON_INCLUDES) $(COMMON_LIBS) -DCOMPILE_KERNEL
+# Perf test infrastructure (tools.h)
+PERF_INCLUDE := -I$(PROJECT_ROOT)/test/include
 
-test-internode-twosided: test_internode_twosided.cpp
-	@echo "Compiling $@"
-	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_internode_twosided test_internode_twosided.cpp $(LIBSRCFILES) $(COMMON_INCLUDES) $(COMMON_LIBS) -DCOMPILE_KERNEL
+# Aggregate all includes for .cpp targets
+ALL_INCLUDES := $(CCL_INCLUDE) $(FLAGCX_INCLUDES) $(IR_INCLUDE) $(PLATFORM_INCLUDES) \
+                $(LOCAL_INCLUDE) $(PERF_INCLUDE) $(MPI_INCLUDE) \
+                -I$(DEVICE_INCLUDE)
 
-test-internode-onesided: test_internode_onesided.cpp
-	@echo "Compiling $@"
-	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_internode_onesided test_internode_onesided.cpp $(LIBSRCFILES) $(COMMON_INCLUDES) $(COMMON_LIBS) -DCOMPILE_KERNEL
+# Aggregate all includes for .cu targets (adds adaptor internals for nvcc)
+CU_INCLUDES := $(ALL_INCLUDES) \
+               -I$(PROJECT_ROOT)/flagcx/adaptor/include/device_api
 
-test-device-api: test_device_api.cpp
-	@echo "Compiling $@"
-	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_device_api test_device_api.cpp $(LIBSRCFILES) $(COMMON_INCLUDES) $(COMMON_LIBS) -DCOMPILE_KERNEL
+# ---------------------------------------------------------------------------
+# Link flags — FLAGCX_LINK from make.inc provides -L, -rpath (absolute), -lflagcx
+# ---------------------------------------------------------------------------
+ALL_LINK := $(FLAGCX_LINK) $(MPI_LINK) $(DEVICE_LINK)
 
-test-multi-fifo: test_multi_fifo.cpp
-	@echo "Compiling $@"
-	@$(COMPILER) $(EXTRA_COMPILER_FLAG) -o test_multi_fifo test_multi_fifo.cpp $(LIBSRCFILES) $(COMMON_INCLUDES) $(COMMON_LIBS) -DCOMPILE_KERNEL
+# ---------------------------------------------------------------------------
+# Shared objects: device_api.o + device_ir.o + tools.o (compiled once)
+# ---------------------------------------------------------------------------
+DEVICE_API_OBJ := $(OBJDIR)/device_api.o
+DEVICE_IR_OBJ  := $(OBJDIR)/device_ir.o
+TOOLS_OBJ      := $(OBJDIR)/tools.o
 
+# ---------------------------------------------------------------------------
+# Targets — one binary per test source
+# ---------------------------------------------------------------------------
+CPP_TESTS := test_intranode test_internode_twosided test_internode_onesided \
+             test_device_api test_multi_fifo test_device_ir
+
+ALL_TARGETS := $(CPP_TESTS:%=$(BINDIR)/%)
+
+.PHONY: all clean device_api.o
+
+all: $(ALL_TARGETS)
+
+# Alias for test/unittest/kernel/Makefile: `make -C test/kernel device_api.o`
+device_api.o: $(DEVICE_API_OBJ)
+
+# ---------------------------------------------------------------------------
+# Compile rules
+# ---------------------------------------------------------------------------
+
+# CUDA kernel object (device_api.cu)
+$(DEVICE_API_OBJ): device_api.cu device_api.h
+	@mkdir -p $(OBJDIR)
+	@echo "Compiling $< (CUDA)"
+	@$(DEVICE_COMPILER) -std=c++17 $(DEVICE_COMPILER_GENCODE) -c -o $@ $< \
+		$(CU_INCLUDES) -DCOMPILE_KERNEL $(ADAPTOR_DEFINE)
+
+# CUDA kernel object (device_ir.cu — IR wrapper tests)
+$(DEVICE_IR_OBJ): device_ir.cu device_ir.h
+	@mkdir -p $(OBJDIR)
+	@echo "Compiling $< (CUDA)"
+	@$(DEVICE_COMPILER) -std=c++17 $(DEVICE_COMPILER_GENCODE) -c -o $@ $< \
+		$(CU_INCLUDES) -DCOMPILE_KERNEL $(ADAPTOR_DEFINE)
+
+# tools.cc (shared perf infrastructure)
+$(TOOLS_OBJ): $(PROJECT_ROOT)/test/tools.cc
+	@mkdir -p $(OBJDIR)
+	@echo "Compiling tools.cc"
+	@$(CXX) $< -o $@ -c $(CXXFLAGS) $(ALL_INCLUDES)
+
+# C++ test binaries (default: link with device_api.o)
+$(BINDIR)/%: %.cpp $(DEVICE_API_OBJ) $(TOOLS_OBJ)
+	@mkdir -p $(BINDIR)
+	@echo "Linking   $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $< $(DEVICE_API_OBJ) $(TOOLS_OBJ) \
+		$(ALL_INCLUDES) $(ALL_LINK) -DCOMPILE_KERNEL
+
+# test_device_ir links with device_ir.o instead of device_api.o
+$(BINDIR)/test_device_ir: test_device_ir.cpp $(DEVICE_IR_OBJ) $(TOOLS_OBJ)
+	@mkdir -p $(BINDIR)
+	@echo "Linking   $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $< $(DEVICE_IR_OBJ) $(TOOLS_OBJ) \
+		$(ALL_INCLUDES) $(ALL_LINK) -DCOMPILE_KERNEL
+
+# ---------------------------------------------------------------------------
+# Clean
+# ---------------------------------------------------------------------------
 clean:
-	@rm -f test_intranode test_internode_twosided test_internode_onesided test_device_api test_multi_fifo
-
-print_var:
-	@echo "INCLUDEDIR: $(INCLUDEDIR)"
-	@echo "USE_NVIDIA: $(USE_NVIDIA)"
-	@echo "MPI_INCLUDE: $(MPI_INCLUDE)"
-	@echo "MPI_LIB: $(MPI_LIB)"
-	@echo "COMPILER: $(COMPILER)"
-	@echo "EXTRA_COMPILER_FLAG: $(EXTRA_COMPILER_FLAG)"
+	@rm -rf $(BUILDDIR)

@@ -27,17 +27,45 @@
  ************************************************************************/
 
 #include "device_api/flagcx_device.h"
+#if defined(USE_DU_ADAPTOR)
+#include "du_adaptor.h"
+#else
 #include "nvidia_adaptor.h"
+#endif
 #include "global_comm.h"
 #include "flagcx_kernel.h"
 #include <cuda_runtime.h>
 
-// Helper: advance intra-barrier epoch by nBarSyncs, accounting for topology.
-// Each bar.sync does syncsPerBarrier intra syncs (1 single-node, 2 multi-node).
-static inline void advanceIntraEpoch(flagcxDevComm_t devComm, int nBarSyncs) {
-  int syncsPerBarrier = (devComm->nInterPeers > 0) ? 2 : 1;
-  devComm->intraBarrierEpoch += nBarSyncs * syncsPerBarrier;
+// Datatype size helper (moved from flagcx/kernels/flagcx_kernel_device.cu)
+FLAGCX_DEVICE_DECORATOR size_t
+getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
+  switch (dtype) {
+    case flagcxChar:
+      return sizeof(char);
+    case flagcxUint8:
+      return sizeof(unsigned char);
+    case flagcxInt:
+      return sizeof(int);
+    case flagcxUint32:
+      return sizeof(unsigned int);
+    case flagcxInt64:
+      return sizeof(long long);
+    case flagcxUint64:
+      return sizeof(unsigned long long);
+    case flagcxHalf:
+      return 2;
+    case flagcxFloat:
+      return sizeof(float);
+    case flagcxDouble:
+      return sizeof(double);
+    case flagcxBfloat16:
+      return 2;
+    default:
+      return 0;
+  }
 }
+
+
 
 // ==========================================================================
 // 1. Intra-node AllReduce
@@ -137,9 +165,6 @@ flagcxResult_t flagcxIntraAllReduce(flagcxDevMem_t devMem, size_t count,
   default:
     return flagcxInvalidArgument;
   }
-
-  // Advance barrier epoch for next launch (2 syncs, each epoch += 1)
-  devComm->intraBarrierEpoch += 2;
 
   return (err == cudaSuccess) ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
@@ -255,12 +280,6 @@ flagcxResult_t flagcxInterOneSidedAlltoAll(flagcxDevMem_t sendMem,
 
   cudaError_t err = cudaGetLastError();
 
-  // Advance barrier epochs: 2 bar.syncs per kernel.
-  // flagcxDevBarrier<flagcxTeamTagWorld>::sync does (nInterPeers>0): 2 intra + 1 inter,
-  //                              or (nInterPeers==0): 1 intra.
-  advanceIntraEpoch(devComm, 2);
-  devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
-
   return (err == cudaSuccess) ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -282,10 +301,6 @@ flagcxResult_t flagcxInterTwoSidedAlltoAll(flagcxDevMem_t sendMem,
          *(cudaStream_t *)stream>>>(sm, rm, count, datatype, dc);
 
   cudaError_t err = cudaGetLastError();
-
-  // Advance barrier epochs (2 bar.syncs per kernel)
-  advanceIntraEpoch(devComm, 2);
-  devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
 
   return (err == cudaSuccess) ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
@@ -745,8 +760,6 @@ flagcxResult_t flagcxInterTestPutSignalInc(flagcxDevMem_t sendMem,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(sm, rm, count, datatype, dc);
   cudaError_t err = cudaGetLastError();
-  advanceIntraEpoch(devComm, 2);
-  devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -762,8 +775,6 @@ flagcxResult_t flagcxInterTestPutSignalAddDecoupled(flagcxDevMem_t sendMem,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(sm, rm, count, datatype, dc);
   cudaError_t err = cudaGetLastError();
-  advanceIntraEpoch(devComm, 2);
-  devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -781,10 +792,6 @@ flagcxResult_t flagcxInterTestCounterPipeline(flagcxDevMem_t sendMem,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(sm, rm, count, datatype, dc, resultBuf);
   cudaError_t err = cudaGetLastError();
-  // K3 CounterPipeline: 3 bar.syncs (pre-barrier + post-round1 + post-round2).
-  // Each bar.sync does syncsPerBarrier intra syncs (1 single-node, 2 multi-node).
-  advanceIntraEpoch(devComm, 3);
-  devComm->interBarrierEpoch += 3 * devComm->nInterPeers;
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -799,8 +806,6 @@ flagcxResult_t flagcxInterTestPutValue(flagcxDevMem_t recvMem,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(rm, dc, putValBase);
   cudaError_t err = cudaGetLastError();
-  advanceIntraEpoch(devComm, 2);
-  devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -812,14 +817,6 @@ flagcxResult_t flagcxInterTestSignal(flagcxDevComm_t devComm,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(dc);
   cudaError_t err = cudaGetLastError();
-  // K5 SignalOnly: multi-node = 2 bar.syncs (pre + post), single-node = 1 bar.sync
-  // (no inter-peer ops to bracket, barrier-only). Epoch accounting reflects this.
-  if (devComm->nInterPeers > 0) {
-    devComm->intraBarrierEpoch += 4; // 2 bar.syncs × 2 intra syncs each
-    devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
-  } else {
-    devComm->intraBarrierEpoch += 1; // 1 bar.sync × 1 intra sync
-  }
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -836,8 +833,6 @@ flagcxResult_t flagcxInterTestFlushDecouple(flagcxDevMem_t sendMem,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(sm, rm, count, datatype, dc);
   cudaError_t err = cudaGetLastError();
-  advanceIntraEpoch(devComm, 2);
-  devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -849,14 +844,6 @@ flagcxResult_t flagcxInterTestFollowShadow(flagcxDevComm_t devComm,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(dc);
   cudaError_t err = cudaGetLastError();
-  // K8 FollowShadow: multi-node = 2 bar.syncs, single-node = 1 bar.sync.
-  // Asymmetric epoch accounting same as K5.
-  if (devComm->nInterPeers > 0) {
-    devComm->intraBarrierEpoch += 4;
-    devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
-  } else {
-    devComm->intraBarrierEpoch += 1;
-  }
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -868,14 +855,6 @@ flagcxResult_t flagcxInterTestMeetShadow(flagcxDevComm_t devComm,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(dc);
   cudaError_t err = cudaGetLastError();
-  // K9 MeetShadow: multi-node = 2 bar.syncs, single-node = 1 bar.sync.
-  // Asymmetric epoch accounting same as K5.
-  if (devComm->nInterPeers > 0) {
-    devComm->intraBarrierEpoch += 4;
-    devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
-  } else {
-    devComm->intraBarrierEpoch += 1;
-  }
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -888,8 +867,6 @@ flagcxResult_t flagcxInterTestReset(flagcxDevComm_t devComm,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(dc, resultBuf);
   cudaError_t err = cudaGetLastError();
-  advanceIntraEpoch(devComm, 2);
-  devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
@@ -959,7 +936,5 @@ flagcxResult_t flagcxInterTestGet(flagcxDevMem_t sendMem,
       <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
          *(cudaStream_t *)stream>>>(sm, rm, count, datatype, dc);
   cudaError_t err = cudaGetLastError();
-  advanceIntraEpoch(devComm, 2);
-  devComm->interBarrierEpoch += 2 * devComm->nInterPeers;
   return err == cudaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }

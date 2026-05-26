@@ -27,7 +27,7 @@
 // ============================================================
 // NVIDIA Vendor Backend (NCCL device API)
 // ============================================================
-#if NCCL_VERSION_CODE > NCCL_VERSION(2, 28, 0) &&                              \
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0) &&                             \
     !defined(FLAGCX_FORCE_FALLBACK)
 
 #include "nccl_device.h"
@@ -294,23 +294,6 @@ struct CommTraits<NvidiaVendor> {
     FLAGCX_DEVICE_INLINE_DECORATOR bool isIntraPeer(int peer) const {
       int intraBase = _dc.getRank() - _dc.getIntraRank();
       return peer >= intraBase && peer < intraBase + _dc.getIntraSize();
-    }
-
-    // ---- store: write to peer's LSA pointer ----
-    template <typename T>
-    FLAGCX_DEVICE_INLINE_DECORATOR void
-    store(const Window &win, size_t byteOffset, int peer, T val) const {
-      T *ptr = (T *)win.getIntraPointer(byteOffset, peer);
-      if (ptr)
-        *ptr = val;
-    }
-
-    // ---- load: read from peer's LSA pointer ----
-    template <typename T>
-    FLAGCX_DEVICE_INLINE_DECORATOR T load(const Window &win, size_t byteOffset,
-                                          int peer) const {
-      const T *ptr = (const T *)win.getIntraPointer(byteOffset, peer);
-      return ptr ? *ptr : T{};
     }
 
     // --- One-sided: put (raw Window) ---
