@@ -156,44 +156,61 @@ bool useHeteroComm() {
   return false;
 }
 
-flagcxResult_t flagcxHandleInit(flagcxHandlerGroup_t *handler) {
+flagcxResult_t flagcxDeviceHandleInit(flagcxDeviceHandle_t *devHandle) {
+  if (devHandle == NULL) {
+    WARN("flagcxDeviceHandleInit: devHandle is NULL");
+    return flagcxInvalidArgument;
+  }
   flagcxResult_t res = flagcxSuccess;
   flagcxDeviceAdaptorPluginInit();
   flagcxCCLAdaptorPluginInit();
-  (*handler) = NULL;
-  FLAGCXCHECKGOTO(flagcxCalloc(handler, 1), res, fail);
-  FLAGCXCHECKGOTO(flagcxCalloc(&(*handler)->uniqueId, 1), res, fail);
-  // comm left NULL — allocated by flagcxCommInitRank
-  FLAGCXCHECKGOTO(flagcxCalloc(&(*handler)->devHandle, 1), res, fail);
-  *(*handler)->devHandle = globalDeviceHandle;
+  (*devHandle) = NULL;
+  FLAGCXCHECKGOTO(flagcxCalloc(devHandle, 1), res, fail);
+  **devHandle = globalDeviceHandle;
   return flagcxSuccess;
 
 fail:
-  if (*handler) {
-    free((*handler)->uniqueId);
-    free((*handler)->devHandle);
-    free(*handler);
-    *handler = NULL;
+  if (*devHandle) {
+    free(*devHandle);
+    *devHandle = NULL;
   }
   flagcxCCLAdaptorPluginFinalize();
   flagcxDeviceAdaptorPluginFinalize();
   return res;
 }
 
-flagcxResult_t flagcxHandleFree(flagcxHandlerGroup_t handler) {
-  if (handler != NULL) {
-    if (handler->uniqueId)
-      free(handler->uniqueId);
-    if (handler->devHandle)
-      free(handler->devHandle);
-    handler->uniqueId = NULL;
-    handler->comm = NULL;
-    handler->devHandle = NULL;
-    free(handler);
-    handler = NULL;
-  }
+flagcxResult_t flagcxDeviceHandleFree(flagcxDeviceHandle_t devHandle) {
+  if (devHandle == NULL)
+    return flagcxSuccess;
+  free(devHandle);
   flagcxCCLAdaptorPluginFinalize();
   flagcxDeviceAdaptorPluginFinalize();
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxHandleInit(flagcxHandlerGroup_t *handler) {
+  flagcxResult_t res = flagcxSuccess;
+  (*handler) = NULL;
+  FLAGCXCHECKGOTO(flagcxCalloc(handler, 1), res, fail);
+  FLAGCXCHECKGOTO(flagcxDeviceHandleInit(&(*handler)->devHandle), res, fail);
+  return flagcxSuccess;
+
+fail:
+  if (*handler) {
+    free(*handler);
+    *handler = NULL;
+  }
+  return res;
+}
+
+flagcxResult_t flagcxHandleFree(flagcxHandlerGroup_t handler) {
+  if (handler != NULL) {
+    flagcxDeviceHandleFree(handler->devHandle);
+    handler->devHandle = NULL;
+    handler->uniqueId = NULL;
+    handler->comm = NULL;
+    free(handler);
+  }
   return flagcxSuccess;
 }
 
@@ -1180,10 +1197,10 @@ flagcxResult_t flagcxGetVersion(int *version) {
   return flagcxHeteroGetVersion(version);
 }
 
-flagcxResult_t flagcxGetUniqueId(flagcxUniqueId_t *uniqueId) {
-  // Allocate if caller passed a NULL pointer
-  if (*uniqueId == nullptr) {
-    FLAGCXCHECK(flagcxCalloc(uniqueId, 1));
+flagcxResult_t flagcxGetUniqueId(flagcxUniqueId_t uniqueId) {
+  if (uniqueId == NULL) {
+    WARN("flagcxGetUniqueId: uniqueId is NULL");
+    return flagcxInvalidArgument;
   }
 
   // Init bootstrap net
@@ -1194,9 +1211,9 @@ flagcxResult_t flagcxGetUniqueId(flagcxUniqueId_t *uniqueId) {
   FLAGCXCHECK(bootstrapGetUniqueId(&handle));
   // flagcxUniqueId and bootstrapHandle don't have the same size and alignment
   // reset to 0 to avoid undefined data
-  memset((void *)*uniqueId, 0, sizeof(**uniqueId));
+  memset((void *)uniqueId, 0, sizeof(*uniqueId));
   // copy to avoid alignment mismatch
-  memcpy((void *)*uniqueId, &handle, sizeof(handle));
+  memcpy((void *)uniqueId, &handle, sizeof(handle));
   return flagcxSuccess;
 }
 
@@ -1523,6 +1540,14 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     WARN("Invalid rank requested : %d/%d", rank, nranks);
     return flagcxInvalidArgument;
   }
+  if (commId == NULL || comm == NULL) {
+    WARN("flagcxCommInitRank: commId or comm is NULL");
+    return flagcxInvalidArgument;
+  }
+
+  // Ensure device/CCL plugins are loaded (idempotent, ref-counted)
+  flagcxDeviceAdaptorPluginInit();
+  flagcxCCLAdaptorPluginInit();
 
   (*comm) = NULL;
   flagcxCalloc(comm, 1);
@@ -1729,7 +1754,8 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
   INFO(FLAGCX_INIT, "Flagcx USE_TUNER flag set to %d", useTuner);
   if (useTuner) {
     (*comm)->tuner = &internalTuner;
-    (*comm)->commId = commId;
+    FLAGCXCHECK(flagcxCalloc(&(*comm)->commId, 1));
+    memcpy((*comm)->commId, commId, sizeof(flagcxUniqueId));
     (*comm)->uniqueIdData = uniqueIdData;
     (*comm)->tunerInnerComm = NULL;
     (*comm)->isTunningComm = false;
@@ -2013,12 +2039,17 @@ flagcxResult_t flagcxCommDestroy(flagcxComm_t comm) {
   // Destroy tuner
   if (comm->tuner) {
     comm->tuner->destroy(comm->tunerContext);
-    // Free uniqueIdData
+    // Free uniqueIdData and commId
     free(comm->uniqueIdData);
+    free(comm->commId);
   }
 
   // Finalize net adaptor plugin (dlclose)
   FLAGCXCHECK(flagcxNetAdaptorPluginFinalize());
+
+  // Finalize device/CCL adaptor plugins (ref-counted)
+  flagcxCCLAdaptorPluginFinalize();
+  flagcxDeviceAdaptorPluginFinalize();
 
   free(comm);
   return flagcxSuccess;
