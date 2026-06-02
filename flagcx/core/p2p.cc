@@ -764,10 +764,11 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm,
   for (int p = 0; p < nPeers; p++) {
     int peerRank = peerRanks[p];
 
-    // Check cache: existing info with handleReady for this peer
+    // Check cache: existing info with handleReady for this peer (this comm
+    // only)
     flagcxIpcRegInfo *existingInfo = NULL;
     for (auto &handlePair : regItem->handles) {
-      if (handlePair.second.handle) {
+      if (handlePair.second.handle && handlePair.second.ownerComm == comm) {
         flagcxIpcRegInfo *info = (flagcxIpcRegInfo *)handlePair.second.handle;
         if (info->peerRank == peerRank) {
           existingInfo = info;
@@ -817,9 +818,9 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm,
       } else if (legacyIpcCap) {
         // Different process: get IPC handle for our own buffer
         char zeros[sizeof(flagcxIpcHandleData)] = {};
-        if (memcmp(&regItem->ipcHandleData, zeros,
+        if (memcmp(&regItem->localIpcHandleData, zeros,
                    sizeof(flagcxIpcHandleData)) != 0) {
-          memcpy(&handleData, &regItem->ipcHandleData,
+          memcpy(&handleData, &regItem->localIpcHandleData,
                  sizeof(flagcxIpcHandleData));
         } else {
           flagcxIpcMemHandle_t ipcHandle = NULL;
@@ -832,7 +833,7 @@ static flagcxResult_t p2pRegisterBuffer(flagcxHeteroComm *comm,
               fail);
           if (handleSize <= sizeof(flagcxIpcHandleData)) {
             memcpy(&handleData, ipcHandle, handleSize);
-            memcpy(&regItem->ipcHandleData, ipcHandle, handleSize);
+            memcpy(&regItem->localIpcHandleData, ipcHandle, handleSize);
           }
           deviceAdaptor->ipcMemHandleFree(ipcHandle);
         }

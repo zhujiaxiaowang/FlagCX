@@ -6,11 +6,14 @@
 #include "flagcx.h"
 #include "net.h"
 #include "register.h"
-#include <map>
+#include <memory>
 #include <unistd.h>
+#include <unordered_map>
 
 class flagcxRegPool {
 public:
+  static constexpr uintptr_t GLOBAL_POOL_KEY = 0; // nullptr comm maps here
+
   flagcxRegPool();
   ~flagcxRegPool();
 
@@ -23,18 +26,22 @@ public:
                               struct flagcxProxyConnector *proxyConn);
   flagcxResult_t removeRegItemP2pHandles(void *comm, flagcxRegItem *reg);
   flagcxResult_t removeAllP2pHandles(void *comm);
+  flagcxResult_t removeAllNetHandles(void *comm);
   flagcxResult_t registerBuffer(void *comm, void *data, size_t length);
   flagcxResult_t deregisterBuffer(void *comm, void *handle);
-  std::map<uintptr_t, std::map<uintptr_t, flagcxRegItem *>> &getGlobalMap();
+  std::unordered_map<uintptr_t, std::unordered_map<uintptr_t, flagcxRegItem *>>
+      &getGlobalMap();
   flagcxRegItem *getItem(const void *comm, void *data);
   void dump();
 
 private:
   void mapRegItemPages(uintptr_t commKey, flagcxRegItem *reg);
-  std::map<uintptr_t, std::map<uintptr_t, flagcxRegItem *>>
+  std::unordered_map<uintptr_t, std::unordered_map<uintptr_t, flagcxRegItem *>>
       regMap; // <commPtr, <pageBasePtr, regItemPtr>>
-  std::map<uintptr_t, std::list<flagcxRegItem>>
-      regPool; // <commPtr, regItemList>
+  std::unordered_map<
+      uintptr_t, std::unordered_map<uintptr_t, std::unique_ptr<flagcxRegItem>>>
+      regPool; // <commPtr, <beginAddr, regItem>> (only GLOBAL_POOL_KEY owns
+               // data)
   uintptr_t pageSize;
 };
 
