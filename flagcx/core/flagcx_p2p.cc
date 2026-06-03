@@ -12,15 +12,19 @@
 #include "flagcx_p2p.h"
 
 #include "adaptor.h"
+#include "debug.h"
 #include "flagcx_net.h"
 #include "flagcx_net_adaptor.h"
 #include "ib_common.h"
+#include "ibvwrap.h"
 #include "p2p_topo.h"
+#include "param.h"
 #include "socket.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +44,129 @@
 
 extern struct flagcxNetAdaptor flagcxNetIbP2p;
 
+extern "C" flagcxResult_t flagcxP2pSliceBatch(void *sendComm, struct ibv_qp *qp,
+                                              int count, FlagcxSlice **slices);
+
+namespace {
+
+FLAGCX_PARAM(P2pQpsPerConn, "P2P_QPS_PER_CONN", 4);
+FLAGCX_PARAM(P2pWorkersPerPool, "P2P_WORKERS_PER_POOL", 4);
+FLAGCX_PARAM(P2pShardCount, "P2P_SHARD_COUNT", 8);
+FLAGCX_PARAM(P2pCqDepth, "P2P_CQ_DEPTH", 4096);
+FLAGCX_PARAM(P2pMaxWrPerPost, "P2P_MAX_WR_PER_POST", 256);
+FLAGCX_PARAM(P2pMaxRequests, "P2P_MAX_REQUESTS", 256);
+FLAGCX_PARAM(P2pBatchPollSize, "P2P_BATCH_POLL_SIZE", 64);
+FLAGCX_PARAM(P2pSliceSize, "P2P_SLICE_SIZE", 1LL << 30);
+FLAGCX_PARAM(P2pFragmentLimit, "P2P_FRAGMENT_LIMIT", 4096);
+FLAGCX_PARAM(P2pMaxSge, "P2P_MAX_SGE", 4);
+FLAGCX_PARAM(P2pMaxInline, "P2P_MAX_INLINE", 64);
+FLAGCX_PARAM(P2pIbPort, "P2P_IB_PORT", 1);
+FLAGCX_PARAM(P2pGidIndex, "P2P_GID_INDEX", -1);
+FLAGCX_PARAM(P2pMtu, "P2P_MTU", 4096);
+FLAGCX_PARAM(P2pIbTc, "P2P_IB_TC", -1);
+FLAGCX_PARAM(P2pRetryCnt, "P2P_RETRY_CNT", 7);
+FLAGCX_PARAM(P2pNotifMaxPeers, "P2P_NOTIF_MAX_PEERS", 64);
+FLAGCX_PARAM(P2pDestDevAffinity, "P2P_DEST_DEV_AFFINITY", 0);
+
+template <typename T>
+inline T clampParam(int64_t v, T lo, T hi, T deft, const char *name) {
+  if (v < (int64_t)lo || v > (int64_t)hi) {
+    INFO(FLAGCX_INIT,
+         "Ignore FLAGCX_%s=%lld (out of [%lld,%lld]); using default %lld", name,
+         (long long)v, (long long)lo, (long long)hi, (long long)deft);
+    return deft;
+  }
+  return (T)v;
+}
+
+void loadGlobalConfig(FlagcxP2pGlobalConfig &c) {
+  c.qpsPerConn =
+      clampParam<int>(flagcxParamP2pQpsPerConn(), 1, kFlagcxP2pMaxQpsPerEngine,
+                      4, "P2P_QPS_PER_CONN");
+  c.workersPerPool = clampParam<int>(flagcxParamP2pWorkersPerPool(), 1, 8, 4,
+                                     "P2P_WORKERS_PER_POOL");
+  c.shardCount =
+      clampParam<int>(flagcxParamP2pShardCount(), 1, 64, 8, "P2P_SHARD_COUNT");
+  c.sharedCqDepth = clampParam<size_t>(flagcxParamP2pCqDepth(), 1, 1u << 20,
+                                       4096, "P2P_CQ_DEPTH");
+  c.maxWrPerPost = clampParam<size_t>(flagcxParamP2pMaxWrPerPost(), 1, 1024,
+                                      256, "P2P_MAX_WR_PER_POST");
+  c.maxRequests = clampParam<size_t>(flagcxParamP2pMaxRequests(), 1, 1u << 16,
+                                     256, "P2P_MAX_REQUESTS");
+  c.batchPollSize = clampParam<size_t>(flagcxParamP2pBatchPollSize(), 1, 256,
+                                       64, "P2P_BATCH_POLL_SIZE");
+  c.sliceSize = clampParam<size_t>(flagcxParamP2pSliceSize(), 0, 1u << 30,
+                                   1u << 30, "P2P_SLICE_SIZE");
+  c.fragmentLimit = clampParam<size_t>(flagcxParamP2pFragmentLimit(), 0,
+                                       c.sliceSize, 4096, "P2P_FRAGMENT_LIMIT");
+  c.maxSge =
+      clampParam<size_t>(flagcxParamP2pMaxSge(), 1, 32, 4, "P2P_MAX_SGE");
+  c.maxInline = clampParam<size_t>(flagcxParamP2pMaxInline(), 0, 1024, 64,
+                                   "P2P_MAX_INLINE");
+  c.ibPort =
+      clampParam<uint8_t>(flagcxParamP2pIbPort(), 1, 255, 1, "P2P_IB_PORT");
+  c.gidIndex =
+      clampParam<int>(flagcxParamP2pGidIndex(), -1, 255, -1, "P2P_GID_INDEX");
+  {
+    int64_t mv = flagcxParamP2pMtu();
+    if (mv == 512 || mv == 1024 || mv == 2048 || mv == 4096) {
+      c.mtuLength = (int)mv;
+    } else {
+      WARN(
+          "Ignore FLAGCX_P2P_MTU=%lld (must be 512/1024/2048/4096); using 4096",
+          (long long)mv);
+      c.mtuLength = 4096;
+    }
+  }
+  c.ibTrafficClass =
+      clampParam<int>(flagcxParamP2pIbTc(), -1, 255, -1, "P2P_IB_TC");
+  c.retryCnt =
+      clampParam<int>(flagcxParamP2pRetryCnt(), 0, 7, 7, "P2P_RETRY_CNT");
+  c.notifMaxPeers = clampParam<int>(flagcxParamP2pNotifMaxPeers(), 1, 1024, 64,
+                                    "P2P_NOTIF_MAX_PEERS");
+  c.enableDestDeviceAffinity = (flagcxParamP2pDestDevAffinity() != 0);
+}
+
+void dumpGlobalConfigImpl(const FlagcxP2pGlobalConfig &c);
+
+FlagcxP2pGlobalConfig &mutableGlobalConfig() {
+  static FlagcxP2pGlobalConfig cfg;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    loadGlobalConfig(cfg);
+    dumpGlobalConfigImpl(cfg);
+  });
+  return cfg;
+}
+
+void dumpGlobalConfigImpl(const FlagcxP2pGlobalConfig &c) {
+  INFO(FLAGCX_INIT, "=== FlagCX P2P GlobalConfig ===");
+  INFO(FLAGCX_INIT, "qpsPerConn=%d workersPerPool=%d shardCount=%d",
+       c.qpsPerConn, c.workersPerPool, c.shardCount);
+  INFO(FLAGCX_INIT,
+       "sharedCqDepth=%zu maxWrPerPost=%zu maxRequests=%zu batchPollSize=%zu",
+       c.sharedCqDepth, c.maxWrPerPost, c.maxRequests, c.batchPollSize);
+  INFO(FLAGCX_INIT, "sliceSize=%zu fragmentLimit=%zu", c.sliceSize,
+       c.fragmentLimit);
+  INFO(FLAGCX_INIT,
+       "ibPort=%u gidIndex=%d mtu=%d tc=%d retry=%d "
+       "maxSge=%zu maxInline=%zu",
+       (unsigned)c.ibPort, c.gidIndex, c.mtuLength, c.ibTrafficClass,
+       c.retryCnt, c.maxSge, c.maxInline);
+  INFO(FLAGCX_INIT, "notifMaxPeers=%d destDevAffinity=%d", c.notifMaxPeers,
+       (int)c.enableDestDeviceAffinity);
+}
+
+} // namespace
+
+const FlagcxP2pGlobalConfig &flagcxP2pGlobalConfig() {
+  return mutableGlobalConfig();
+}
+
+void flagcxP2pDumpGlobalConfig() {
+  dumpGlobalConfigImpl(flagcxP2pGlobalConfig());
+}
+
 struct FlagcxP2pMrHandleView {
   uintptr_t baseVa;
   uint32_t lkey;
@@ -58,7 +185,7 @@ static_assert(sizeof(FlagcxP2pListenHandleView) <= FLAGCX_NET_HANDLE_MAXSIZE,
 struct FlagcxP2pCommView {
   int ibDevN;
   struct flagcxIbNetCommDevBase base;
-  struct flagcxIbQp qp;
+  struct flagcxIbQp qp_list_[kFlagcxP2pMaxQpsPerEngine];
   struct flagcxSocket sock;
 };
 
@@ -79,6 +206,21 @@ struct FlagcxP2pCtrlMeta {
 };
 static_assert(sizeof(FlagcxP2pCtrlMeta) == 16,
               "FlagcxP2pCtrlMeta size must be stable");
+
+struct FlagcxP2pRemoteRegion {
+  uint64_t baseAddr;
+  uint64_t size;
+  uint32_t rkey;
+};
+
+struct FlagcxP2pMemRegWire {
+  uint64_t baseAddr;
+  uint64_t size;
+  uint32_t rkey;
+  uint32_t reserved;
+};
+static_assert(sizeof(FlagcxP2pMemRegWire) == 24,
+              "FlagcxP2pMemRegWire size must be stable");
 
 struct FlagcxP2pIpcInfo {
   alignas(8) char handleData[FLAGCX_P2P_IPC_HANDLE_BYTES];
@@ -122,10 +264,20 @@ struct FlagcxP2pEngine {
 #if defined(__linux__)
   int notifEpollFd;
 #endif
-  std::thread notifThread;
   std::atomic<bool> stopNotif;
   std::unordered_map<int, FlagcxP2pNotifConn> notifPeers;
   std::mutex notifPeerMutex;
+
+  /* Control-plane RPC service: accept daemon + per-session connection
+     cache (initiator side) + kept-alive accepted connections (server
+     side). See flagcxP2pEngineStartRpcServer / GetConn. */
+  std::thread rpcServerThread;
+  std::atomic<bool> rpcServerActive;
+  std::atomic<bool> stopRpcServer;
+  std::unordered_map<std::string, FlagcxP2pConn *> sessionConns;
+  std::mutex sessionMutex;
+  std::vector<FlagcxP2pConn *> acceptedConns;
+  std::mutex acceptedMutex;
 };
 
 struct FlagcxP2pConn {
@@ -139,6 +291,7 @@ struct FlagcxP2pConn {
   bool sameProcess;
   struct flagcxSocket notifSock;
   bool notifSockConnected;
+  std::vector<FlagcxP2pRemoteRegion> remoteRegions;
 };
 
 struct FlagcxP2pMemRegEntry {
@@ -174,6 +327,7 @@ static std::vector<FlagcxP2pNotifyMsg> gNotifyList;
 static std::mutex gNotifyMutex;
 
 static std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry> gMemRegInfo;
+static std::unordered_map<FlagcxP2pMr, uintptr_t> gMrToBaseAddr;
 static std::mutex gMemMutex;
 static uint64_t gNextMrId = 1;
 
@@ -181,182 +335,627 @@ static std::unordered_map<uint64_t, FlagcxP2pXfer> gXferMap;
 static std::mutex gXferMutex;
 static uint64_t gNextXferId = 1;
 
-/* ------------------------------------------------------------------ */
-/*  Async Transfer Worker Infrastructure                               */
-/* ------------------------------------------------------------------ */
+inline void flagcxBuildSlicesRuntime(FlagcxTransferTask *task, uint64_t srcVa,
+                                     uint64_t dstVa, size_t totalLen,
+                                     uint32_t lkey, uint32_t rkey,
+                                     uint8_t opcode,
+                                     const std::string &peerNicPath,
+                                     size_t blockSize, size_t fragmentSize) {
+  if (blockSize == 0 || totalLen <= blockSize) {
+    auto *s = new FlagcxSlice{srcVa,       dstVa, (uint32_t)totalLen,
+                              lkey,        rkey,  opcode,
+                              peerNicPath, task,  nullptr};
+    task->sliceList.push_back(s);
+    task->sliceCount.fetch_add(1, std::memory_order_release);
+    return;
+  }
 
-static constexpr int kWindowSize = 64;
-static constexpr int kBatchPollCqe = 32;
+  size_t off = 0;
+  while (off < totalLen) {
+    bool merge = (totalLen - off) <= blockSize + fragmentSize;
+    size_t len = merge ? (totalLen - off) : blockSize;
+    auto *s =
+        new FlagcxSlice{srcVa + off, dstVa + off, (uint32_t)len, lkey,   rkey,
+                        opcode,      peerNicPath, task,          nullptr};
+    task->sliceList.push_back(s);
+    task->sliceCount.fetch_add(1, std::memory_order_release);
+    off += len;
+    if (merge)
+      break;
+  }
+}
 
-enum AsyncXferOp { ASYNC_XFER_READ, ASYNC_XFER_WRITE };
+static void notifPollThreadFunc(FlagcxP2pEngine *engine);
 
-struct AsyncTransferTask {
+namespace {
+
+struct PoolQpEntry {
+  struct ibv_qp *qp;
+  void *sendComm; // owning conn (flagcxP2pSendComm/RecvComm)
+  volatile int wrDepth;
+
+  PoolQpEntry(struct ibv_qp *q, void *sc) : qp(q), sendComm(sc), wrDepth(0) {}
+  PoolQpEntry(const PoolQpEntry &) = delete;
+  PoolQpEntry &operator=(const PoolQpEntry &) = delete;
+};
+
+class FlagcxWorkerPool {
+public:
+  FlagcxWorkerPool(int ibDevN, struct ibv_context *ctx);
+  ~FlagcxWorkerPool();
+  FlagcxWorkerPool(const FlagcxWorkerPool &) = delete;
+  FlagcxWorkerPool &operator=(const FlagcxWorkerPool &) = delete;
+
+  struct ibv_cq *getSharedCq() const {
+    return shared_cq_;
+  }
+  void registerQp(void *sendComm, struct ibv_qp *qp);
+  void unregisterQp(struct ibv_qp *qp);
+
+  flagcxResult_t submitPostSend(void *sendComm, FlagcxSlice **slices,
+                                int count);
+
+  void startNotif(FlagcxP2pEngine *engine);
+  void stopNotif();
+
+private:
+  void transferWorkerLoop(int tid);
+  void performPostSend(int tid);
+  void performPollCq();
+  void notifWorkerLoop();
+
+  static uint64_t nowNs() {
+    using clk = std::chrono::steady_clock;
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               clk::now().time_since_epoch())
+        .count();
+  }
+
+  int ibDevN_;
+  struct ibv_cq *shared_cq_ = nullptr;
+
+  int numWorkers_;
+  int numShards_;
+  size_t maxWrPerPost_;
+  size_t batchPollSize_;
+  int maxWrDepth_ = 0;
+
+  std::mutex qp_mu_;
+  std::vector<std::unique_ptr<PoolQpEntry>> qpEntries_;
+  std::unordered_map<uint32_t, int> qpNumToIdx_;
+  std::vector<std::vector<int>> workerQpIdx_;
+  std::vector<size_t> workerQpCursor_;
+  std::unordered_map<void *, int> connQpRegCount_;
+  std::vector<std::unordered_map<void *, std::vector<FlagcxSlice *>>>
+      slice_queues_;
+  std::unique_ptr<std::mutex[]> slice_locks_;
+  std::unique_ptr<std::atomic<int>[]> slice_queue_count_;
+  std::atomic<uint64_t> shardRoundRobin_{0};
+  std::vector<std::unordered_map<void *, std::vector<FlagcxSlice *>>>
+      collective_slice_queue_;
+
+  std::atomic<uint64_t> submitted_{0};
+  std::atomic<uint64_t> processed_{0};
+  std::atomic<int> suspended_flag_{0};
+  std::condition_variable cv_;
+  std::mutex cv_mu_;
+
+  std::atomic<bool> running_{true};
+  std::vector<std::thread> transferThreads_;
+
+  FlagcxP2pEngine *engine_ = nullptr;
+  std::thread notifThread_;
+  std::atomic<bool> notifSpawned_{false};
+};
+
+FlagcxWorkerPool::FlagcxWorkerPool(int ibDevN, struct ibv_context *ctx)
+    : ibDevN_(ibDevN) {
+  const auto &C = flagcxP2pGlobalConfig();
+  numWorkers_ = C.workersPerPool;
+  numShards_ = C.shardCount;
+  maxWrPerPost_ = C.maxWrPerPost;
+  batchPollSize_ = C.batchPollSize;
+
+  if (numWorkers_ > 0 && numShards_ % numWorkers_ != 0) {
+    int rounded = ((numShards_ + numWorkers_ - 1) / numWorkers_) * numWorkers_;
+    INFO(FLAGCX_INIT,
+         "NET/IB_P2P : pool[%d] rounded shardCount %d → %d for even "
+         "worker assignment (W=%d)",
+         ibDevN_, numShards_, rounded, numWorkers_);
+    numShards_ = rounded;
+  }
+
+  if (numWorkers_ > 0 && C.qpsPerConn % numWorkers_ != 0) {
+    WARN("NET/IB_P2P : pool[%d] qpsPerEngine=%d not divisible by "
+         "workersPerPool=%d — QPs spread per connection but unevenly; some "
+         "workers will own more QPs than others for each conn",
+         ibDevN_, C.qpsPerConn, numWorkers_);
+  }
+
+  flagcxResult_t res = flagcxWrapIbvCreateCq(
+      &shared_cq_, ctx, (int)C.sharedCqDepth, NULL, NULL, 0);
+  if (res != flagcxSuccess) {
+    WARN("NET/IB_P2P : pool[%d] failed to create shared CQ", ibDevN_);
+    shared_cq_ = nullptr;
+    return;
+  }
+  INFO(FLAGCX_INIT,
+       "NET/IB_P2P : pool[%d] shared CQ created (depth=%zu, workers=%d, "
+       "shards=%d, qpsPerConn=%d)",
+       ibDevN_, C.sharedCqDepth, numWorkers_, numShards_, C.qpsPerConn);
+
+  slice_queues_.resize(numShards_);
+  slice_locks_.reset(new std::mutex[numShards_]);
+  slice_queue_count_.reset(new std::atomic<int>[numShards_]);
+  for (int s = 0; s < numShards_; s++)
+    slice_queue_count_[s].store(0, std::memory_order_relaxed);
+
+  workerQpIdx_.resize(numWorkers_);
+  workerQpCursor_.assign(numWorkers_, 0);
+  collective_slice_queue_.resize(numWorkers_);
+
+  transferThreads_.reserve(numWorkers_);
+  for (int t = 0; t < numWorkers_; t++) {
+    transferThreads_.emplace_back([this, t] { this->transferWorkerLoop(t); });
+  }
+}
+
+FlagcxWorkerPool::~FlagcxWorkerPool() {
+  running_.store(false, std::memory_order_release);
+  cv_.notify_all();
+  for (auto &t : transferThreads_) {
+    if (t.joinable())
+      t.join();
+  }
+  // notifThread_ is joined explicitly via stopNotif() in EngineDestroy;
+  // by the time ~pool runs at process exit it should already be joined.
+  if (notifThread_.joinable()) {
+    notifThread_.join();
+  }
+  // CQ destruction skipped: pool is process-lived; OS reclaims.
+}
+
+void FlagcxWorkerPool::startNotif(FlagcxP2pEngine *engine) {
+  if (engine == nullptr)
+    return;
+  // Compare-exchange ensures only the first attach spawns the thread.
+  bool expected = false;
+  if (!notifSpawned_.compare_exchange_strong(expected, true)) {
+    // Already attached — keep existing engine pointer (or update if NULL).
+    if (engine_ == nullptr)
+      engine_ = engine;
+    return;
+  }
+  engine_ = engine;
+  notifThread_ = std::thread([this] { this->notifWorkerLoop(); });
+  INFO(FLAGCX_INIT, "NET/IB_P2P : pool[%d] notifWorker spawned", ibDevN_);
+}
+
+void FlagcxWorkerPool::stopNotif() {
+  // Caller must have set engine_->stopNotif before calling — that breaks
+  // the epoll loop in notifPollThreadFunc.
+  if (notifThread_.joinable()) {
+    notifThread_.join();
+  }
+  engine_ = nullptr;
+  notifSpawned_.store(false, std::memory_order_release);
+}
+
+void FlagcxWorkerPool::notifWorkerLoop() {
+  if (engine_ == nullptr)
+    return;
+  // Reuse the original engine-side body — same behavior, just owned by
+  // the pool's thread.
+  notifPollThreadFunc(engine_);
+}
+
+void FlagcxWorkerPool::registerQp(void *sendComm, struct ibv_qp *qp) {
+  if (!qp || numWorkers_ <= 0)
+    return;
+
+  std::lock_guard<std::mutex> lk(qp_mu_);
+
+  if (maxWrDepth_ == 0) {
+    struct ibv_qp_attr attr;
+    struct ibv_qp_init_attr initAttr;
+    memset(&attr, 0, sizeof(attr));
+    memset(&initAttr, 0, sizeof(initAttr));
+    if (flagcxWrapIbvQueryQp(qp, &attr, IBV_QP_CAP, &initAttr) ==
+        flagcxSuccess) {
+      int cap = (int)initAttr.cap.max_send_wr;
+      if (cap > 0) {
+        maxWrDepth_ = cap;
+        INFO(FLAGCX_INIT,
+             "NET/IB_P2P : pool[%d] resolved max_wr_depth=%d from first QP",
+             ibDevN_, cap);
+      }
+    } else {
+      WARN("NET/IB_P2P : pool[%d] ibv_query_qp failed; max_wr_depth "
+           "stays unresolved (slice posts will fall back to no gate)",
+           ibDevN_);
+    }
+  }
+
+  int idx = (int)qpEntries_.size();
+  qpEntries_.emplace_back(new PoolQpEntry(qp, sendComm));
+  qpNumToIdx_[qp->qp_num] = idx;
+
+  int connIdx = connQpRegCount_[sendComm]++;
+  int slot = connIdx % numWorkers_;
+  workerQpIdx_[slot].push_back(idx);
+}
+
+void FlagcxWorkerPool::unregisterQp(struct ibv_qp *qp) {
+  if (!qp)
+    return;
+  std::lock_guard<std::mutex> lk(qp_mu_);
+  auto it = qpNumToIdx_.find(qp->qp_num);
+  if (it == qpNumToIdx_.end())
+    return;
+  int idx = it->second;
+  qpNumToIdx_.erase(it);
+  void *sc = qpEntries_[idx]->sendComm;
+  for (auto &shard : workerQpIdx_) {
+    auto vit = std::find(shard.begin(), shard.end(), idx);
+    if (vit != shard.end()) {
+      shard.erase(vit);
+      break;
+    }
+  }
+  auto cit = connQpRegCount_.find(sc);
+  if (cit != connQpRegCount_.end() && --cit->second <= 0)
+    connQpRegCount_.erase(cit);
+  // Slot kept alive (NULL'd) so any in-flight slice's qpDepth pointer stays
+  // valid.
+  qpEntries_[idx]->qp = nullptr;
+  qpEntries_[idx]->sendComm = nullptr;
+}
+
+flagcxResult_t FlagcxWorkerPool::submitPostSend(void *sendComm,
+                                                FlagcxSlice **slices,
+                                                int count) {
+  if (count <= 0 || slices == nullptr)
+    return flagcxSuccess;
+
+  // Backpressure: spin-yield until in-flight count drops below threshold.
+  // Prevents unbounded queue growth under sustained submission bursts.
+  const size_t maxPending = flagcxP2pGlobalConfig().maxRequests * 4;
+  while (submitted_.load(std::memory_order_acquire) -
+             processed_.load(std::memory_order_acquire) >
+         maxPending) {
+    std::this_thread::yield();
+  }
+
+  std::vector<std::vector<FlagcxSlice *>> perShard(numShards_);
+  int enqueued = 0;
+  for (int i = 0; i < count; i++) {
+    if (slices[i] == nullptr)
+      continue;
+    int shard = (int)(shardRoundRobin_.fetch_add(1, std::memory_order_relaxed) %
+                      numShards_);
+    perShard[shard].push_back(slices[i]);
+    enqueued++;
+  }
+  if (enqueued == 0)
+    return flagcxSuccess;
+
+  for (int s = 0; s < numShards_; s++) {
+    if (perShard[s].empty())
+      continue;
+    std::lock_guard<std::mutex> lk(slice_locks_[s]);
+    auto &vec = slice_queues_[s][sendComm];
+    vec.insert(vec.end(), perShard[s].begin(), perShard[s].end());
+    slice_queue_count_[s].fetch_add((int)perShard[s].size(),
+                                    std::memory_order_relaxed);
+  }
+  submitted_.fetch_add(enqueued, std::memory_order_release);
+
+  if (suspended_flag_.load(std::memory_order_acquire) > 0) {
+    std::lock_guard<std::mutex> lk(cv_mu_);
+    cv_.notify_all();
+  }
+  return flagcxSuccess;
+}
+
+void FlagcxWorkerPool::transferWorkerLoop(int tid) {
+  const static uint64_t kWaitPeriodInNano = 100ull * 1000 * 1000; // 100ms
+  uint64_t last_wait_ts = nowNs();
+
+  while (running_.load(std::memory_order_relaxed)) {
+    auto processed_slice_count = processed_.load(std::memory_order_relaxed);
+    auto submitted_slice_count = submitted_.load(std::memory_order_relaxed);
+
+    if (processed_slice_count == submitted_slice_count) {
+      uint64_t curr_wait_ts = nowNs();
+      if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
+        std::unique_lock<std::mutex> lock(cv_mu_);
+        suspended_flag_.fetch_add(1);
+        if (processed_.load(std::memory_order_relaxed) ==
+            submitted_.load(std::memory_order_relaxed)) {
+          cv_.wait_for(lock, std::chrono::seconds(1));
+        }
+        suspended_flag_.fetch_sub(1);
+        last_wait_ts = curr_wait_ts;
+      }
+      continue;
+    }
+
+    performPostSend(tid);
+    performPollCq();
+  }
+}
+
+void FlagcxWorkerPool::performPostSend(int tid) {
+  if (numWorkers_ <= 0)
+    return;
+
+  auto &local = collective_slice_queue_[tid];
+  for (int s = tid; s < numShards_; s += numWorkers_) {
+    if (slice_queue_count_[s].load(std::memory_order_relaxed) == 0)
+      continue;
+    std::lock_guard<std::mutex> lk(slice_locks_[s]);
+    for (auto &entry : slice_queues_[s]) {
+      if (entry.second.empty())
+        continue;
+      auto &dst = local[entry.first];
+      dst.insert(dst.end(), entry.second.begin(), entry.second.end());
+      entry.second.clear();
+    }
+    slice_queue_count_[s].store(0, std::memory_order_relaxed);
+  }
+
+  std::vector<PoolQpEntry *> myQpEntries;
+  int curMaxDepth;
+  {
+    std::lock_guard<std::mutex> lk(qp_mu_);
+    myQpEntries.reserve(workerQpIdx_[tid].size());
+    for (int idx : workerQpIdx_[tid])
+      myQpEntries.push_back(qpEntries_[idx].get());
+    curMaxDepth = maxWrDepth_;
+  }
+
+  size_t &cursor = workerQpCursor_[tid];
+  for (auto &entry : local) {
+    void *sc = entry.first;
+    auto &pending = entry.second;
+    if (pending.empty())
+      continue;
+
+    std::vector<PoolQpEntry *> myQpOnComm;
+    myQpOnComm.reserve(myQpEntries.size());
+    for (PoolQpEntry *e : myQpEntries) {
+      if (e && e->qp != nullptr && e->sendComm == sc)
+        myQpOnComm.push_back(e);
+    }
+    if (myQpOnComm.empty()) {
+      WARN("NET/IB_P2P : pool[%d] worker %d owns no QP for Engine %p; "
+           "failing %zu slices",
+           ibDevN_, tid, sc, pending.size());
+      for (auto *sl : pending)
+        sl->markFailed();
+      processed_.fetch_add(pending.size(), std::memory_order_release);
+      pending.clear();
+      continue;
+    }
+
+    const size_t ringSz = myQpOnComm.size();
+    size_t i = 0;
+    while (i < pending.size()) {
+      PoolQpEntry *chosen = nullptr;
+      size_t take = 0;
+      for (size_t k = 0; k < ringSz; k++) {
+        PoolQpEntry *e = myQpOnComm[(cursor + k) % ringSz];
+        int cur = e->wrDepth;
+        size_t room;
+        if (curMaxDepth == 0) {
+          room = pending.size() - i; // depth unknown: no gate
+        } else if (cur >= curMaxDepth) {
+          continue; // this QP is full, try the next one
+        } else {
+          room = (size_t)(curMaxDepth - cur);
+        }
+        take = std::min<size_t>({room, maxWrPerPost_, pending.size() - i});
+        chosen = e;
+        cursor = (cursor + k + 1) % ringSz;
+        break;
+      }
+
+      if (chosen == nullptr)
+        break; // all of this worker's QPs for the engine are full; retry later
+
+      volatile int *depthPtr = &chosen->wrDepth;
+      __sync_fetch_and_add(depthPtr, (int)take);
+
+      std::vector<FlagcxSlice *> chunk;
+      chunk.reserve(take);
+      for (size_t k = 0; k < take; k++) {
+        FlagcxSlice *sl = pending[i + k];
+        sl->qpDepth = depthPtr;
+        chunk.push_back(sl);
+      }
+
+      flagcxResult_t rc =
+          flagcxP2pSliceBatch(sc, chosen->qp, (int)take, chunk.data());
+      if (rc != flagcxSuccess)
+        processed_.fetch_add(take, std::memory_order_release);
+      i += take;
+    }
+    // Drop the posted prefix; anything left stays for the next iteration.
+    if (i > 0)
+      pending.erase(pending.begin(), pending.begin() + i);
+  }
+}
+
+void FlagcxWorkerPool::performPollCq() {
+  if (shared_cq_ == nullptr)
+    return;
+
+  constexpr int kMaxPollBatch = 256;
+  struct ibv_wc wcs[kMaxPollBatch];
+  int batch = (int)std::min<size_t>(batchPollSize_, kMaxPollBatch);
+  int n = 0;
+  if (flagcxWrapIbvPollCq(shared_cq_, batch, wcs, &n) != flagcxSuccess) {
+    WARN("NET/IB_P2P : ibv_poll_cq failed on shared CQ %p", shared_cq_);
+    return;
+  }
+  if (n == 0)
+    return;
+
+  uint64_t sliceProgressed = 0;
+  std::unordered_map<volatile int *, int> qpDepthSet;
+  for (int i = 0; i < n; i++) {
+    uintptr_t raw = (uintptr_t)wcs[i].wr_id;
+    if (raw == 0 || (raw & 1ull) == 0)
+      continue;
+
+    FlagcxSlice *slice =
+        reinterpret_cast<FlagcxSlice *>(raw & ~(uintptr_t)1ull);
+    if (slice->qpDepth != NULL)
+      qpDepthSet[slice->qpDepth]++;
+    if (wcs[i].status != IBV_WC_SUCCESS) {
+      WARN("NET/IB_P2P : pool poll error status %d for slice %p", wcs[i].status,
+           slice);
+      slice->markFailed();
+    } else {
+      slice->markSuccess();
+    }
+    sliceProgressed++;
+  }
+  for (auto &entry : qpDepthSet)
+    __sync_fetch_and_sub(entry.first, entry.second);
+  if (sliceProgressed > 0)
+    processed_.fetch_add(sliceProgressed, std::memory_order_release);
+}
+
+// ---- Per-ibDev singleton plumbing -----------------------------------
+
+static std::unique_ptr<FlagcxWorkerPool> gPools[MAX_IB_DEVS];
+static std::mutex gPoolMu;
+
+static FlagcxWorkerPool *getOrCreatePool(int ibDevN, struct ibv_context *ctx) {
+  if (ibDevN < 0 || ibDevN >= MAX_IB_DEVS || ctx == NULL)
+    return NULL;
+  std::lock_guard<std::mutex> lk(gPoolMu);
+  if (!gPools[ibDevN])
+    gPools[ibDevN].reset(new FlagcxWorkerPool(ibDevN, ctx));
+  return gPools[ibDevN].get();
+}
+
+static FlagcxWorkerPool *lookupPool(int ibDevN) {
+  if (ibDevN < 0 || ibDevN >= MAX_IB_DEVS)
+    return nullptr;
+  std::lock_guard<std::mutex> lk(gPoolMu);
+  return gPools[ibDevN].get();
+}
+
+} // namespace
+
+// ---- Hooks consumed by ibrc_p2p_adaptor.cc (forward-declared there). ----
+struct ibv_cq *flagcxP2pPoolGetSharedCq(int ibDevN, struct ibv_context *ctx) {
+  FlagcxWorkerPool *pool = getOrCreatePool(ibDevN, ctx);
+  return pool ? pool->getSharedCq() : NULL;
+}
+
+void flagcxP2pPoolRegisterQp(int ibDevN, void *sendComm, struct ibv_qp *qp) {
+  if (qp == nullptr)
+    return;
+  FlagcxWorkerPool *pool = lookupPool(ibDevN);
+  if (pool)
+    pool->registerQp(sendComm, qp);
+}
+
+void flagcxP2pPoolUnregisterQp(int ibDevN, struct ibv_qp *qp) {
+  if (qp == nullptr)
+    return;
+  FlagcxWorkerPool *pool = lookupPool(ibDevN);
+  if (pool)
+    pool->unregisterQp(qp);
+}
+
+flagcxResult_t flagcxP2pPoolSubmit(int ibDevN, void *sendComm,
+                                   FlagcxSlice **slices, int count) {
+  FlagcxWorkerPool *pool = lookupPool(ibDevN);
+  if (pool == nullptr) {
+    WARN("NET/IB_P2P : flagcxP2pPoolSubmit on uninitialized pool[%d]", ibDevN);
+    return flagcxInternalError;
+  }
+  return pool->submitPostSend(sendComm, slices, count);
+}
+
+void flagcxP2pPoolStartNotif(int ibDevN, struct ibv_context *ctx,
+                             FlagcxP2pEngine *engine) {
+  FlagcxWorkerPool *pool = getOrCreatePool(ibDevN, ctx);
+  if (pool == nullptr) {
+    WARN("NET/IB_P2P : pool[%d] cannot be created for notif", ibDevN);
+    return;
+  }
+  pool->startNotif(engine);
+}
+
+void flagcxP2pPoolStopNotif() {
+  // Stop notif on whichever pool currently owns it (only one does — the
+  // first that StartNotif touched).
+  std::lock_guard<std::mutex> lk(gPoolMu);
+  for (int i = 0; i < MAX_IB_DEVS; i++) {
+    if (gPools[i])
+      gPools[i]->stopNotif();
+  }
+}
+
+struct PoolTransferTask {
+  FlagcxTransferTask fx;
   FlagcxP2pConn *conn;
-  AsyncXferOp op;
-  int numIovs;
-  std::vector<void *> dataVec;
-  std::vector<size_t> sizeVec;
-  std::vector<FlagcxP2pRdmaDesc> descs;
-  std::vector<FlagcxP2pMemRegEntry> localEntries;
-  std::atomic<bool> done{false};
-  std::atomic<int> result{0};
+  std::atomic<bool> postOk{true};
 };
-
-struct AsyncWorker {
-  std::thread thread;
-  pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-  pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
-  std::deque<std::shared_ptr<AsyncTransferTask>> queue;
-  std::atomic<bool> stop{false};
-};
-
-static AsyncWorker gAsyncWorker;
 
 static FlagcxP2pCommView *getCommView(void *comm) {
   return reinterpret_cast<FlagcxP2pCommView *>(comm);
 }
 
-static void asyncWorkerFunc() {
-  while (true) {
-    std::shared_ptr<AsyncTransferTask> task;
-    pthread_mutex_lock(&gAsyncWorker.mutex);
-    while (gAsyncWorker.queue.empty() && !gAsyncWorker.stop.load()) {
-      pthread_cond_wait(&gAsyncWorker.cv, &gAsyncWorker.mutex);
+static bool
+buildAndSubmitToPool(PoolTransferTask *task, const std::vector<void *> &dataVec,
+                     const std::vector<size_t> &sizeVec,
+                     const std::vector<FlagcxP2pRdmaDesc> &descs,
+                     const std::vector<FlagcxP2pMemRegEntry> &localEntries,
+                     int numIovs, void *sendComm, int connIbDevN,
+                     uint8_t opcode) {
+  for (int i = 0; i < numIovs; i++) {
+    if (localEntries[i].ibDevN != connIbDevN) {
+      WARN("NET/IB_P2P : iov[%d] ibDevN mismatch (%d vs conn %d)", i,
+           localEntries[i].ibDevN, connIbDevN);
+      for (auto *s : task->fx.sliceList)
+        s->markFailed();
+      return false;
     }
-    if (gAsyncWorker.stop.load() && gAsyncWorker.queue.empty()) {
-      pthread_mutex_unlock(&gAsyncWorker.mutex);
-      return;
-    }
-    task = gAsyncWorker.queue.front();
-    gAsyncWorker.queue.pop_front();
-    pthread_mutex_unlock(&gAsyncWorker.mutex);
-
-    FlagcxP2pConn *conn = task->conn;
-    struct flagcxNetAdaptor *adaptor = conn->engine->adaptor;
-    const int numIovs = task->numIovs;
-    const int connIbDevN = getCommView(conn->sendComm)->ibDevN;
-
-    std::vector<void *> inflightReqs(kWindowSize, nullptr);
-    int issued = 0, completed = 0;
-    bool error = false;
-
-    while (completed < numIovs && !error) {
-      // Post up to kWindowSize ahead of completed
-      while (issued < numIovs && (issued - completed) < kWindowSize) {
-        if (task->localEntries[issued].ibDevN != connIbDevN) {
-          error = true;
-          break;
-        }
-
-        FlagcxP2pMrHandleView *localMr =
-            reinterpret_cast<FlagcxP2pMrHandleView *>(
-                task->localEntries[issued].mhandle);
-
-        FlagcxP2pMrHandleView remoteMr;
-        memset(&remoteMr, 0, sizeof(remoteMr));
-        remoteMr.baseVa = task->descs[issued].addr;
-        remoteMr.rkey = task->descs[issued].rkey;
-
-        void *request = NULL;
-        flagcxResult_t rc;
-
-        if (task->op == ASYNC_XFER_READ) {
-          const uint64_t srcOff = 0;
-          const uint64_t dstOff =
-              (uintptr_t)task->dataVec[issued] - localMr->baseVa;
-          rc = adaptor->iget(conn->sendComm, srcOff, dstOff,
-                             task->sizeVec[issued], 0, 0, (void **)&remoteMr,
-                             (void **)task->localEntries[issued].mhandle,
-                             &request);
-        } else {
-          const uint64_t srcOff =
-              (uintptr_t)task->dataVec[issued] - localMr->baseVa;
-          const uint64_t dstOff = 0;
-          rc = adaptor->iput(conn->sendComm, srcOff, dstOff,
-                             task->sizeVec[issued], 0, 0,
-                             (void **)task->localEntries[issued].mhandle,
-                             (void **)&remoteMr, &request);
-        }
-
-        if (rc != flagcxSuccess) {
-          error = true;
-          break;
-        }
-
-        inflightReqs[issued % kWindowSize] = request;
-        issued++;
-      }
-
-      // Batch-poll completions for in-flight requests
-      int newlyCompleted = 0;
-      for (int i = completed; i < issued; i++) {
-        int slot = i % kWindowSize;
-        if (inflightReqs[slot] == nullptr) {
-          if (i == completed)
-            completed++;
-          continue;
-        }
-        int done = 0, sizes = 0;
-        flagcxResult_t res = adaptor->test(inflightReqs[slot], &done, &sizes);
-        if (res != flagcxSuccess) {
-          inflightReqs[slot] = nullptr;
-          if (i == completed)
-            completed++;
-          newlyCompleted++;
-          continue;
-        }
-        if (done) {
-          inflightReqs[slot] = nullptr;
-          if (i == completed)
-            completed++;
-          newlyCompleted++;
-        }
-      }
-
-      // Advance completed pointer over contiguous completions
-      while (completed < issued &&
-             inflightReqs[completed % kWindowSize] == nullptr) {
-        completed++;
-      }
-
-      // Yield briefly if no progress was made
-      if (newlyCompleted == 0 && issued >= numIovs) {
-        std::this_thread::sleep_for(std::chrono::microseconds(1));
-      }
-    }
-
-    task->result.store(error ? -1 : 0, std::memory_order_release);
-    task->done.store(true, std::memory_order_release);
+    auto *localMr =
+        reinterpret_cast<FlagcxP2pMrHandleView *>(localEntries[i].mhandle);
+    uint64_t localVa = (uintptr_t)dataVec[i];
+    uint64_t remoteVa = descs[i].addr;
+    const auto &sliceCfg = flagcxP2pGlobalConfig();
+    flagcxBuildSlicesRuntime(
+        &task->fx, localVa, remoteVa, sizeVec[i], localMr->lkey, descs[i].rkey,
+        opcode, std::string(), sliceCfg.sliceSize, sliceCfg.fragmentLimit);
   }
+
+  if (task->fx.sliceList.empty()) {
+    return false;
+  }
+
+  flagcxResult_t rc =
+      flagcxP2pPoolSubmit(connIbDevN, sendComm, task->fx.sliceList.data(),
+                          (int)task->fx.sliceList.size());
+  if (rc != flagcxSuccess) {
+    task->postOk.store(false, std::memory_order_release);
+    for (auto *s : task->fx.sliceList)
+      s->markFailed();
+    return false;
+  }
+  return true;
 }
 
-static std::mutex gAsyncWorkerLifecycleMutex;
-
-static void ensureAsyncWorkerStarted() {
-  std::lock_guard<std::mutex> lock(gAsyncWorkerLifecycleMutex);
-  if (gAsyncWorker.thread.joinable() && !gAsyncWorker.stop.load())
-    return; // already running
-  // If previously stopped, join the old thread before restarting
-  if (gAsyncWorker.thread.joinable()) {
-    gAsyncWorker.thread.join();
-  }
-  gAsyncWorker.stop.store(false);
-  gAsyncWorker.thread = std::thread(asyncWorkerFunc);
-}
-
-static void stopAsyncWorker() {
-  std::lock_guard<std::mutex> lock(gAsyncWorkerLifecycleMutex);
-  gAsyncWorker.stop.store(true);
-  pthread_cond_broadcast(&gAsyncWorker.cv);
-  if (gAsyncWorker.thread.joinable()) {
-    gAsyncWorker.thread.join();
-  }
-}
-
-// Map from transfer ID to async task (for XferStatus polling)
-static std::unordered_map<uint64_t, std::shared_ptr<AsyncTransferTask>>
-    gAsyncXferMap;
-static std::mutex gAsyncXferMutex;
+static std::unordered_map<uint64_t, std::shared_ptr<PoolTransferTask>>
+    gPoolXferMap;
+static std::mutex gPoolXferMutex;
 
 static bool findMemReg(uintptr_t addr, FlagcxP2pMemRegEntry *out) {
   for (std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::const_iterator it =
@@ -374,13 +973,26 @@ static bool findMemReg(uintptr_t addr, FlagcxP2pMemRegEntry *out) {
 }
 
 static FlagcxP2pMemRegEntry *findMemRegByMr(FlagcxP2pMr mr) {
-  for (std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::iterator it =
-           gMemRegInfo.begin();
-       it != gMemRegInfo.end(); ++it) {
-    if (it->second.mrId == mr)
-      return &it->second;
-  }
+  std::unordered_map<FlagcxP2pMr, uintptr_t>::const_iterator mrIt =
+      gMrToBaseAddr.find(mr);
+  if (mrIt == gMrToBaseAddr.end())
+    return NULL;
+
+  std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::iterator entryIt =
+      gMemRegInfo.find(mrIt->second);
+  if (entryIt != gMemRegInfo.end())
+    return &entryIt->second;
+
   return NULL;
+}
+
+static bool memRegContains(const FlagcxP2pMemRegEntry &entry, uintptr_t addr,
+                           size_t size) {
+  if (addr < entry.baseAddr)
+    return false;
+
+  const uintptr_t offset = addr - entry.baseAddr;
+  return offset <= entry.size && size <= entry.size - offset;
 }
 
 static int resolveIbDevN(int netDev) {
@@ -993,6 +1605,8 @@ FlagcxP2pEngine *flagcxP2pEngineCreate() {
   engine->notifEpollFd = -1;
 #endif
   engine->stopNotif = false;
+  engine->rpcServerActive = false;
+  engine->stopRpcServer = false;
   memset(engine->listeners, 0, sizeof(engine->listeners));
   memset(&engine->notifListenSock, 0, sizeof(engine->notifListenSock));
 
@@ -1048,8 +1662,8 @@ FlagcxP2pEngine *flagcxP2pEngineCreate() {
 #endif
   }
 
-  if (engine->notifListenActive) {
-    engine->notifThread = std::thread(notifPollThreadFunc, engine);
+  if (engine->notifListenActive && flagcxNIbDevs > 0) {
+    flagcxP2pPoolStartNotif(0, flagcxIbDevs[0].context, engine);
   }
   return engine;
 }
@@ -1058,16 +1672,13 @@ void flagcxP2pEngineDestroy(FlagcxP2pEngine *engine) {
   if (engine == NULL)
     return;
 
-  stopAsyncWorker();
-
   engine->stopNotif = true;
+  engine->stopRpcServer = true;
   if (engine->notifListenActive) {
     flagcxSocketClose(&engine->notifListenSock);
     engine->notifListenActive = false;
   }
-  if (engine->notifThread.joinable()) {
-    engine->notifThread.join();
-  }
+  flagcxP2pPoolStopNotif();
 
   {
     std::lock_guard<std::mutex> lock(engine->notifPeerMutex);
@@ -1092,6 +1703,26 @@ void flagcxP2pEngineDestroy(FlagcxP2pEngine *engine) {
     }
   }
 
+  if (engine->rpcServerThread.joinable()) {
+    engine->rpcServerThread.join();
+  }
+  {
+    std::lock_guard<std::mutex> lock(engine->sessionMutex);
+    for (std::unordered_map<std::string, FlagcxP2pConn *>::iterator it =
+             engine->sessionConns.begin();
+         it != engine->sessionConns.end(); ++it) {
+      flagcxP2pEngineConnDestroy(it->second);
+    }
+    engine->sessionConns.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(engine->acceptedMutex);
+    for (size_t i = 0; i < engine->acceptedConns.size(); i++) {
+      flagcxP2pEngineConnDestroy(engine->acceptedConns[i]);
+    }
+    engine->acceptedConns.clear();
+  }
+
   {
     std::lock_guard<std::mutex> lock(gXferMutex);
     for (std::unordered_map<uint64_t, FlagcxP2pXfer>::iterator it =
@@ -1113,6 +1744,7 @@ void flagcxP2pEngineDestroy(FlagcxP2pEngine *engine) {
       engine->adaptor->deregMr(&devCtx, it->second.mhandle);
     }
     gMemRegInfo.clear();
+    gMrToBaseAddr.clear();
   }
 
   if (engine->topoMgr) {
@@ -1138,6 +1770,59 @@ void flagcxP2pEngineStopAccept(FlagcxP2pEngine *engine) {
       engine->listeners[d].listenComm = NULL;
     }
   }
+}
+
+static int exchangeMemRegTable(FlagcxP2pConn *conn) {
+  if (conn == NULL || conn->sendComm == NULL)
+    return -1;
+  FlagcxP2pCommView *view = getCommView(conn->sendComm);
+
+  std::vector<FlagcxP2pMemRegWire> localTable;
+  {
+    std::lock_guard<std::mutex> lock(gMemMutex);
+    localTable.reserve(gMemRegInfo.size());
+    for (std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::iterator it =
+             gMemRegInfo.begin();
+         it != gMemRegInfo.end(); ++it) {
+      FlagcxP2pMrHandleView *mrView =
+          reinterpret_cast<FlagcxP2pMrHandleView *>(it->second.mhandle);
+      if (mrView == NULL)
+        continue;
+      FlagcxP2pMemRegWire w;
+      w.baseAddr = it->second.baseAddr;
+      w.size = it->second.size;
+      w.rkey = mrView->rkey;
+      w.reserved = 0;
+      localTable.push_back(w);
+    }
+  }
+
+  uint32_t localCount = static_cast<uint32_t>(localTable.size());
+  uint32_t remoteCount = 0;
+  if (flagcxSocketSendRecv(&view->sock, &localCount, sizeof(localCount),
+                           &view->sock, &remoteCount,
+                           sizeof(remoteCount)) != flagcxSuccess)
+    return -1;
+
+  std::vector<FlagcxP2pMemRegWire> remoteTable(remoteCount);
+  if (flagcxSocketSendRecv(
+          &view->sock, localTable.data(),
+          static_cast<int>(localCount * sizeof(FlagcxP2pMemRegWire)),
+          &view->sock, remoteTable.data(),
+          static_cast<int>(remoteCount * sizeof(FlagcxP2pMemRegWire))) !=
+      flagcxSuccess)
+    return -1;
+
+  conn->remoteRegions.clear();
+  conn->remoteRegions.reserve(remoteCount);
+  for (uint32_t i = 0; i < remoteCount; i++) {
+    FlagcxP2pRemoteRegion r;
+    r.baseAddr = remoteTable[i].baseAddr;
+    r.size = remoteTable[i].size;
+    r.rkey = remoteTable[i].rkey;
+    conn->remoteRegions.push_back(r);
+  }
+  return 0;
 }
 
 FlagcxP2pConn *flagcxP2pEngineConnect(FlagcxP2pEngine *engine,
@@ -1212,6 +1897,12 @@ FlagcxP2pConn *flagcxP2pEngineConnect(FlagcxP2pEngine *engine,
     connectNotifSocket(conn, &remoteHandle->connectAddr, remoteMeta.notifPort);
   }
 
+  if (exchangeMemRegTable(conn) != 0) {
+    WARN("NET/IB_P2P : connect desc-table exchange failed");
+    flagcxP2pEngineConnDestroy(conn);
+    return NULL;
+  }
+
   return conn;
 }
 
@@ -1269,6 +1960,12 @@ FlagcxP2pConn *flagcxP2pEngineAccept(FlagcxP2pEngine *engine, char *ipAddrBuf,
     connectNotifSocket(conn, &recvView->sock.addr, remoteMeta.notifPort);
   }
 
+  if (exchangeMemRegTable(conn) != 0) {
+    WARN("NET/IB_P2P : accept desc-table exchange failed");
+    flagcxP2pEngineConnDestroy(conn);
+    return NULL;
+  }
+
   return conn;
 }
 
@@ -1308,6 +2005,7 @@ int flagcxP2pEngineReg(FlagcxP2pEngine *engine, uintptr_t data, size_t size,
       gMemRegInfo.find(data);
   if (existing != gMemRegInfo.end()) {
     mrId = existing->second.mrId;
+    gMrToBaseAddr[mrId] = existing->first;
     return 0;
   }
 
@@ -1337,6 +2035,7 @@ int flagcxP2pEngineReg(FlagcxP2pEngine *engine, uintptr_t data, size_t size,
   }
 
   gMemRegInfo[data] = entry;
+  gMrToBaseAddr[entry.mrId] = data;
   mrId = entry.mrId;
   return 0;
 }
@@ -1346,18 +2045,24 @@ void flagcxP2pEngineMrDestroy(FlagcxP2pEngine *engine, FlagcxP2pMr mr) {
     return;
 
   std::lock_guard<std::mutex> lock(gMemMutex);
-  for (std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::iterator it =
-           gMemRegInfo.begin();
-       it != gMemRegInfo.end(); ++it) {
-    if (it->second.mrId == mr) {
-      struct {
-        int ibDevN;
-      } devCtx = {it->second.ibDevN};
-      engine->adaptor->deregMr(&devCtx, it->second.mhandle);
-      gMemRegInfo.erase(it);
-      return;
-    }
+  std::unordered_map<FlagcxP2pMr, uintptr_t>::iterator mrIt =
+      gMrToBaseAddr.find(mr);
+  if (mrIt == gMrToBaseAddr.end())
+    return;
+
+  std::unordered_map<uintptr_t, FlagcxP2pMemRegEntry>::iterator entryIt =
+      gMemRegInfo.find(mrIt->second);
+  if (entryIt == gMemRegInfo.end()) {
+    gMrToBaseAddr.erase(mrIt);
+    return;
   }
+
+  struct {
+    int ibDevN;
+  } devCtx = {entryIt->second.ibDevN};
+  engine->adaptor->deregMr(&devCtx, entryIt->second.mhandle);
+  gMemRegInfo.erase(entryIt);
+  gMrToBaseAddr.erase(mrIt);
 }
 
 int flagcxP2pEnginePrepareDesc(FlagcxP2pEngine *engine, FlagcxP2pMr mr,
@@ -1457,49 +2162,91 @@ int flagcxP2pEngineReadVector(FlagcxP2pConn *conn,
                               std::vector<FlagcxP2pRdmaDesc> descs, int numIovs,
                               uint64_t *transferId,
                               std::vector<char *> ipcBufs) {
-  (void)mrIds;
-  if (conn == NULL || numIovs <= 0 || transferId == NULL)
+  if (conn == NULL || numIovs <= 0 || transferId == NULL) {
+    fprintf(stderr,
+            "[FlagCX P2P] ReadVector early exit: invalid args (conn=%p, "
+            "numIovs=%d, transferId=%p)\n",
+            conn, numIovs, (void *)transferId);
     return -1;
+  }
+
+  if (dstVec.size() < static_cast<size_t>(numIovs) ||
+      sizeVec.size() < static_cast<size_t>(numIovs) ||
+      descs.size() < static_cast<size_t>(numIovs)) {
+    fprintf(stderr,
+            "[FlagCX P2P] ReadVector early exit: vector length mismatch "
+            "(numIovs=%d)\n",
+            numIovs);
+    return -1;
+  }
 
   if (conn->isLocal && (conn->sameProcess || !ipcBufs.empty())) {
-    return startLocalTransfer(conn, dstVec, sizeVec, descs, numIovs, transferId,
-                              ipcBufs, false);
+    fprintf(stderr,
+            "[FlagCX P2P] ReadVector taking local transfer path: numIovs=%d\n",
+            numIovs);
+    int rc = startLocalTransfer(conn, dstVec, sizeVec, descs, numIovs,
+                                transferId, ipcBufs, false);
+    fprintf(stderr, "[FlagCX P2P] ReadVector local transfer returned: rc=%d\n",
+            rc);
+    return rc;
+  }
+
+  if (mrIds.size() < static_cast<size_t>(numIovs)) {
+    fprintf(stderr,
+            "[FlagCX P2P] ReadVector early exit: mrIds length mismatch "
+            "(numIovs=%d)\n",
+            numIovs);
+    return -1;
   }
 
   std::vector<FlagcxP2pMemRegEntry> localEntries(numIovs);
   {
     std::lock_guard<std::mutex> memLock(gMemMutex);
     for (int i = 0; i < numIovs; i++) {
-      if (!findMemReg((uintptr_t)dstVec[i], &localEntries[i]))
+      FlagcxP2pMemRegEntry *entry = findMemRegByMr(mrIds[i]);
+      if (entry == NULL) {
+        fprintf(
+            stderr,
+            "[FlagCX P2P] ReadVector memReg lookup failed: iov=%d, mr=%lu\n", i,
+            (unsigned long)mrIds[i]);
         return -1;
+      }
+
+      if (!memRegContains(*entry, reinterpret_cast<uintptr_t>(dstVec[i]),
+                          sizeVec[i])) {
+        fprintf(stderr,
+                "[FlagCX P2P] ReadVector memReg bounds check failed: iov=%d, "
+                "mr=%lu, addr=%p, size=%zu\n",
+                i, (unsigned long)mrIds[i], dstVec[i], sizeVec[i]);
+        return -1;
+      }
+
+      localEntries[i] = *entry;
     }
   }
 
-  ensureAsyncWorkerStarted();
-
-  auto task = std::make_shared<AsyncTransferTask>();
+  const int connIbDevN = getCommView(conn->sendComm)->ibDevN;
+  auto task = std::make_shared<PoolTransferTask>();
   task->conn = conn;
-  task->op = ASYNC_XFER_READ;
-  task->numIovs = numIovs;
-  task->dataVec = std::move(dstVec);
-  task->sizeVec = std::move(sizeVec);
-  task->descs = std::move(descs);
-  task->localEntries = std::move(localEntries);
 
-  const uint64_t xferId = [&] {
-    std::lock_guard<std::mutex> lock(gAsyncXferMutex);
-    uint64_t id = gNextXferId++;
-    gAsyncXferMap[id] = task;
-    return id;
-  }();
-
-  {
-    pthread_mutex_lock(&gAsyncWorker.mutex);
-    gAsyncWorker.queue.push_back(task);
-    pthread_mutex_unlock(&gAsyncWorker.mutex);
+  if (!buildAndSubmitToPool(task.get(), dstVec, sizeVec, descs, localEntries,
+                            numIovs, conn->sendComm, connIbDevN,
+                            FLAGCX_SLICE_OP_READ)) {
+    // sentinel so isAllDone() converges (needs total>0)
+    auto *sentinel = new FlagcxSlice{
+        0, 0, 0, 0, 0, FLAGCX_SLICE_OP_READ, std::string(), &task->fx, nullptr};
+    task->fx.sliceList.push_back(sentinel);
+    task->fx.sliceCount.fetch_add(1, std::memory_order_release);
+    sentinel->markFailed();
+    task->postOk.store(false, std::memory_order_release);
   }
-  pthread_cond_signal(&gAsyncWorker.cv);
 
+  uint64_t xferId;
+  {
+    std::lock_guard<std::mutex> lock(gPoolXferMutex);
+    xferId = gNextXferId++;
+    gPoolXferMap[xferId] = task;
+  }
   *transferId = xferId;
   return 0;
 }
@@ -1571,8 +2318,12 @@ int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
                                std::vector<FlagcxP2pRdmaDesc> descs,
                                int numIovs, uint64_t *transferId,
                                std::vector<char *> ipcBufs) {
-  (void)mrIds;
   if (conn == NULL || numIovs <= 0 || transferId == NULL)
+    return -1;
+
+  if (dstVec.size() < static_cast<size_t>(numIovs) ||
+      sizeVec.size() < static_cast<size_t>(numIovs) ||
+      descs.size() < static_cast<size_t>(numIovs))
     return -1;
 
   if (conn->isLocal && (conn->sameProcess || !ipcBufs.empty())) {
@@ -1580,40 +2331,47 @@ int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
                               ipcBufs, true);
   }
 
+  if (mrIds.size() < static_cast<size_t>(numIovs))
+    return -1;
+
   std::vector<FlagcxP2pMemRegEntry> localEntries(numIovs);
   {
     std::lock_guard<std::mutex> memLock(gMemMutex);
     for (int i = 0; i < numIovs; i++) {
-      if (!findMemReg((uintptr_t)dstVec[i], &localEntries[i]))
+      FlagcxP2pMemRegEntry *entry = findMemRegByMr(mrIds[i]);
+      if (entry == NULL)
         return -1;
+
+      if (!memRegContains(*entry, reinterpret_cast<uintptr_t>(dstVec[i]),
+                          sizeVec[i]))
+        return -1;
+
+      localEntries[i] = *entry;
     }
   }
 
-  ensureAsyncWorkerStarted();
-
-  auto task = std::make_shared<AsyncTransferTask>();
+  const int connIbDevN = getCommView(conn->sendComm)->ibDevN;
+  auto task = std::make_shared<PoolTransferTask>();
   task->conn = conn;
-  task->op = ASYNC_XFER_WRITE;
-  task->numIovs = numIovs;
-  task->dataVec = std::move(dstVec);
-  task->sizeVec = std::move(sizeVec);
-  task->descs = std::move(descs);
-  task->localEntries = std::move(localEntries);
 
-  const uint64_t xferId = [&] {
-    std::lock_guard<std::mutex> lock(gAsyncXferMutex);
-    uint64_t id = gNextXferId++;
-    gAsyncXferMap[id] = task;
-    return id;
-  }();
-
-  {
-    pthread_mutex_lock(&gAsyncWorker.mutex);
-    gAsyncWorker.queue.push_back(task);
-    pthread_mutex_unlock(&gAsyncWorker.mutex);
+  if (!buildAndSubmitToPool(task.get(), dstVec, sizeVec, descs, localEntries,
+                            numIovs, conn->sendComm, connIbDevN,
+                            FLAGCX_SLICE_OP_WRITE)) {
+    auto *sentinel = new FlagcxSlice{
+        0,         0,      0, 0, 0, FLAGCX_SLICE_OP_WRITE, std::string(),
+        &task->fx, nullptr};
+    task->fx.sliceList.push_back(sentinel);
+    task->fx.sliceCount.fetch_add(1, std::memory_order_release);
+    sentinel->markFailed();
+    task->postOk.store(false, std::memory_order_release);
   }
-  pthread_cond_signal(&gAsyncWorker.cv);
 
+  uint64_t xferId;
+  {
+    std::lock_guard<std::mutex> lock(gPoolXferMutex);
+    xferId = gNextXferId++;
+    gPoolXferMap[xferId] = task;
+  }
   *transferId = xferId;
   return 0;
 }
@@ -1655,13 +2413,22 @@ bool flagcxP2pEngineXferStatus(FlagcxP2pConn *conn, uint64_t transferId) {
   if (conn == NULL)
     return true;
 
-  // Check async transfer map first (for vectored transfers)
   {
-    std::lock_guard<std::mutex> lock(gAsyncXferMutex);
-    auto it = gAsyncXferMap.find(transferId);
-    if (it != gAsyncXferMap.end()) {
-      if (it->second->done.load(std::memory_order_acquire)) {
-        gAsyncXferMap.erase(it);
+    std::lock_guard<std::mutex> lock(gPoolXferMutex);
+    auto it = gPoolXferMap.find(transferId);
+    if (it != gPoolXferMap.end()) {
+      auto &task = it->second;
+      if (task->fx.isAllDone()) {
+        if (task->fx.hasErrors()) {
+          WARN("NET/IB_P2P : transfer %lu completed with %lu failed slices",
+               (unsigned long)transferId,
+               (unsigned long)task->fx.failedCount.load(
+                   std::memory_order_relaxed));
+        }
+        for (auto *s : task->fx.sliceList)
+          delete s;
+        task->fx.sliceList.clear();
+        gPoolXferMap.erase(it);
         return true;
       }
       return false;
@@ -1741,6 +2508,246 @@ int flagcxP2pEngineGetMetadata(FlagcxP2pEngine *engine, char **metadataStr) {
   std::strcpy(*metadataStr, result.c_str());
   return 0;
 }
+
+/* ================================================================== */
+/*  RPC control-plane service                                         */
+/* ================================================================== */
+
+int flagcxP2pEngineGetRpcPort(FlagcxP2pEngine *engine) {
+  if (engine == NULL)
+    return -1;
+  const int netDev = chooseEngineNetDev(engine);
+  if (engine->listeners[netDev].listenComm == NULL)
+    return -1;
+  FlagcxP2pListenHandleView *listenHandle =
+      reinterpret_cast<FlagcxP2pListenHandleView *>(
+          engine->listeners[netDev].handle);
+  return static_cast<int>(socketAddrPort(&listenHandle->connectAddr));
+}
+
+int flagcxP2pEngineStartRpcServer(FlagcxP2pEngine *engine) {
+  if (engine == NULL)
+    return -1;
+  bool expected = false;
+  if (!engine->rpcServerActive.compare_exchange_strong(expected, true))
+    return 0; // already running
+
+  engine->rpcServerThread = std::thread([engine]() {
+    char ipBuf[256];
+    while (!engine->stopRpcServer.load(std::memory_order_acquire)) {
+      int remoteGpu = -1;
+      FlagcxP2pConn *conn =
+          flagcxP2pEngineAccept(engine, ipBuf, sizeof(ipBuf), &remoteGpu);
+      if (engine->stopRpcServer.load(std::memory_order_acquire)) {
+        if (conn != NULL)
+          flagcxP2pEngineConnDestroy(conn);
+        break;
+      }
+      if (conn == NULL)
+        continue;
+      std::lock_guard<std::mutex> lock(engine->acceptedMutex);
+      engine->acceptedConns.push_back(conn);
+    }
+  });
+  INFO(FLAGCX_INIT, "NET/IB_P2P : RPC server thread started (port=%d)",
+       flagcxP2pEngineGetRpcPort(engine));
+  return 0;
+}
+
+FlagcxP2pConn *flagcxP2pEngineGetConn(FlagcxP2pEngine *engine,
+                                      const char *session) {
+  if (engine == NULL || session == NULL)
+    return NULL;
+
+  const std::string key(session);
+  {
+    std::lock_guard<std::mutex> lock(engine->sessionMutex);
+    std::unordered_map<std::string, FlagcxP2pConn *>::iterator it =
+        engine->sessionConns.find(key);
+    if (it != engine->sessionConns.end())
+      return it->second;
+  }
+
+  // Parse "host:port" (split on the last ':' to tolerate IPv6 forms).
+  const size_t pos = key.rfind(':');
+  if (pos == std::string::npos)
+    return NULL;
+  std::string host = key.substr(0, pos);
+  const int port = atoi(key.substr(pos + 1).c_str());
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+    host = host.substr(1, host.size() - 2);
+
+  FlagcxP2pConn *conn =
+      flagcxP2pEngineConnect(engine, host.c_str(), -1, port, false);
+  if (conn == NULL)
+    return NULL;
+
+  std::lock_guard<std::mutex> lock(engine->sessionMutex);
+  std::unordered_map<std::string, FlagcxP2pConn *>::iterator it =
+      engine->sessionConns.find(key);
+  if (it != engine->sessionConns.end()) {
+    // Lost a race; keep the existing one.
+    flagcxP2pEngineConnDestroy(conn);
+    return it->second;
+  }
+  engine->sessionConns[key] = conn;
+  return conn;
+}
+
+int flagcxP2pEngineMakeDesc(FlagcxP2pConn *conn, uint64_t remoteVa,
+                            uint32_t size, FlagcxP2pRdmaDesc *desc) {
+  if (conn == NULL || desc == NULL)
+    return -1;
+  for (size_t i = 0; i < conn->remoteRegions.size(); i++) {
+    const FlagcxP2pRemoteRegion &r = conn->remoteRegions[i];
+    if (remoteVa >= r.baseAddr && remoteVa + size <= r.baseAddr + r.size) {
+      memset(desc, 0, sizeof(*desc));
+      desc->addr = remoteVa;
+      desc->size = size;
+      desc->rkey = r.rkey;
+      return 0;
+    }
+  }
+  return -1;
+}
+
+int flagcxP2pEngineWriteVectorSync(FlagcxP2pConn *conn,
+                                   std::vector<FlagcxP2pMr> mrIds,
+                                   std::vector<void *> srcVec,
+                                   std::vector<size_t> sizeVec,
+                                   std::vector<FlagcxP2pRdmaDesc> descs) {
+  if (conn == NULL)
+    return -1;
+  const int numIovs = static_cast<int>(srcVec.size());
+  if (numIovs <= 0)
+    return 0;
+
+  uint64_t transferId = 0;
+  const int rc = flagcxP2pEngineWriteVector(conn, mrIds, srcVec, sizeVec, descs,
+                                            numIovs, &transferId);
+  if (rc != 0)
+    return rc;
+
+  std::shared_ptr<PoolTransferTask> task;
+  {
+    std::lock_guard<std::mutex> lock(gPoolXferMutex);
+    std::unordered_map<uint64_t, std::shared_ptr<PoolTransferTask>>::iterator
+        it = gPoolXferMap.find(transferId);
+    if (it != gPoolXferMap.end())
+      task = it->second;
+  }
+
+  if (task) {
+    uint64_t spins = 0;
+    while (!task->fx.isAllDone()) {
+      if ((++spins & 0xFFF) == 0) {
+        std::this_thread::yield();
+        continue;
+      }
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#endif
+    }
+    // One-shot cleanup: frees slices and erases the map entry.
+    flagcxP2pEngineXferStatus(conn, transferId);
+    return 0;
+  }
+
+  // Fallback (e.g. the local/IPC path stores the transfer in the legacy
+  // xfer map): poll status, but yield instead of a fixed sleep.
+  while (!flagcxP2pEngineXferStatus(conn, transferId)) {
+    std::this_thread::yield();
+  }
+  return 0;
+}
+
+/* ================================================================== */
+/*  C-ABI facade for ctypes(experimental)                             */
+/* ================================================================== */
+extern "C" {
+
+void *flagcxP2pRpcEngineCreate(void) {
+  return reinterpret_cast<void *>(flagcxP2pEngineCreate());
+}
+
+void flagcxP2pRpcEngineDestroy(void *engine) {
+  flagcxP2pEngineDestroy(reinterpret_cast<FlagcxP2pEngine *>(engine));
+}
+
+int flagcxP2pRpcGetPort(void *engine) {
+  return flagcxP2pEngineGetRpcPort(reinterpret_cast<FlagcxP2pEngine *>(engine));
+}
+
+int flagcxP2pRpcStartServer(void *engine) {
+  return flagcxP2pEngineStartRpcServer(
+      reinterpret_cast<FlagcxP2pEngine *>(engine));
+}
+
+int flagcxP2pRpcRegister(void *engine, uint64_t addr, uint64_t size,
+                         uint64_t *mrIdOut) {
+  if (mrIdOut == NULL)
+    return -1;
+  FlagcxP2pMr mrId = 0;
+  const int rc = flagcxP2pEngineReg(reinterpret_cast<FlagcxP2pEngine *>(engine),
+                                    static_cast<uintptr_t>(addr),
+                                    static_cast<size_t>(size), mrId);
+  if (rc != 0)
+    return rc;
+  *mrIdOut = mrId;
+  return 0;
+}
+
+void *flagcxP2pRpcGetConn(void *engine, const char *session) {
+  return reinterpret_cast<void *>(flagcxP2pEngineGetConn(
+      reinterpret_cast<FlagcxP2pEngine *>(engine), session));
+}
+
+int flagcxP2pRpcBatchWriteSync(void *connPtr, int count, const uint64_t *srcVa,
+                               const uint64_t *dstVa, const uint64_t *sizes) {
+  FlagcxP2pConn *conn = reinterpret_cast<FlagcxP2pConn *>(connPtr);
+  if (conn == NULL || count < 0)
+    return -1;
+  if (count == 0)
+    return 0;
+  if (srcVa == NULL || dstVa == NULL || sizes == NULL)
+    return -1;
+
+  std::vector<FlagcxP2pMr> mrVec(count);
+  std::vector<void *> srcVec(count);
+  std::vector<size_t> sizeVec(count);
+  std::vector<FlagcxP2pRdmaDesc> descs(count);
+
+  // Resolve the local MR for each source VA from the global region table
+  // (gMemRegInfo), mirroring how MakeDesc resolves the remote rkey.
+  {
+    std::lock_guard<std::mutex> memLock(gMemMutex);
+    for (int i = 0; i < count; i++) {
+      FlagcxP2pMemRegEntry localEntry;
+      if (!findMemReg(static_cast<uintptr_t>(srcVa[i]), &localEntry)) {
+        WARN("NET/IB_P2P : BatchWriteSync no local MR for source VA 0x%llx",
+             (unsigned long long)srcVa[i]);
+        return -1;
+      }
+      mrVec[i] = localEntry.mrId;
+    }
+  }
+
+  for (int i = 0; i < count; i++) {
+    srcVec[i] = reinterpret_cast<void *>(static_cast<uintptr_t>(srcVa[i]));
+    sizeVec[i] = static_cast<size_t>(sizes[i]);
+    if (flagcxP2pEngineMakeDesc(conn, dstVa[i], static_cast<uint32_t>(sizes[i]),
+                                &descs[i]) != 0) {
+      WARN("NET/IB_P2P : BatchWriteSync MakeDesc failed for remote VA "
+           "0x%llx size %llu",
+           (unsigned long long)dstVa[i], (unsigned long long)sizes[i]);
+      return -1;
+    }
+  }
+
+  return flagcxP2pEngineWriteVectorSync(conn, mrVec, srcVec, sizeVec, descs);
+}
+
+} // extern "C"
 
 std::vector<FlagcxP2pNotifyMsg> flagcxP2pEngineGetNotifs() {
   std::lock_guard<std::mutex> lock(gNotifyMutex);
