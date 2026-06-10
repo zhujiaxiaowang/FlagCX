@@ -33,7 +33,7 @@ const char *rcclAdaptorGetLastError(flagcxInnerComm_t comm) {
 
 flagcxResult_t rcclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
                                        flagcxUniqueId_t commId, int rank,
-                                       bootstrapState * /*bootstrap*/) {
+                                       struct bootstrapState * /*bootstrap*/) {
   if (*comm == NULL) {
     flagcxCalloc(comm, 1);
   }

@@ -113,9 +113,9 @@ flagcxResult_t flagcxSymWindowRegister(flagcxHeteroComm_t comm, void *buff,
 
         // Barrier to ensure all sockets are created before sending
         struct bootstrapState *state = comm->bootstrap;
-        FLAGCXCHECKGOTO(bootstrapIntraNodeBarrier(state, comm->localRankToRank,
-                                                  localRank, localRanks,
-                                                  /*tag=*/0x5932),
+        FLAGCXCHECKGOTO(bootstrapCollIntraNodeBarrier(
+                            state, comm->localRankToRank, localRank, localRanks,
+                            /*tag=*/0x5932),
                         res, fail);
 
         // Send our FD to each peer
@@ -220,7 +220,7 @@ flagcxResult_t flagcxSymWindowRegister(flagcxHeteroComm_t comm, void *buff,
               mcIpcSockOpen = true;
 
               // Barrier: ensure all peers have created their IPC sockets
-              FLAGCXCHECKGOTO(bootstrapIntraNodeBarrier(
+              FLAGCXCHECKGOTO(bootstrapCollIntraNodeBarrier(
                                   state, comm->localRankToRank, localRank,
                                   localRanks, /*tag=*/0x5934),
                               res, fail);

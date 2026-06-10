@@ -42,7 +42,7 @@ struct flagcxCCLAdaptor_v1 {
   // Communicator functions
   flagcxResult_t (*commInitRank)(flagcxInnerComm_t *comm, int nranks,
                                  flagcxUniqueId *commId, int rank,
-                                 bootstrapState *bootstrap);
+                                 struct bootstrapState *bootstrap);
   flagcxResult_t (*commFinalize)(flagcxInnerComm_t comm);
   flagcxResult_t (*commDestroy)(flagcxInnerComm_t comm);
   flagcxResult_t (*commAbort)(flagcxInnerComm_t comm);
@@ -126,7 +126,7 @@ struct flagcxCCLAdaptor_latest {
   // Communicator functions
   flagcxResult_t (*commInitRank)(flagcxInnerComm_t *comm, int nranks,
                                  flagcxUniqueId *commId, int rank,
-                                 bootstrapState *bootstrap);
+                                 struct bootstrapState *bootstrap);
   flagcxResult_t (*commFinalize)(flagcxInnerComm_t comm);
   flagcxResult_t (*commDestroy)(flagcxInnerComm_t comm);
   flagcxResult_t (*commAbort)(flagcxInnerComm_t comm);

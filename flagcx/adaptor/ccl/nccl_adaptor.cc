@@ -106,7 +106,7 @@ const char *ncclAdaptorGetLastError(flagcxInnerComm_t comm) {
 
 flagcxResult_t ncclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
                                        flagcxUniqueId_t commId, int rank,
-                                       bootstrapState * /*bootstrap*/) {
+                                       struct bootstrapState * /*bootstrap*/) {
   if (*comm == NULL) {
     void *p = malloc(sizeof(struct flagcxInnerComm));
     memset(p, 0, sizeof(struct flagcxInnerComm));

@@ -76,7 +76,7 @@ struct flagcxComm {
   int *clusterIds;
   int *globalRank2HomoRank;
   int *clusterInterRanks;
-  bootstrapState *bootstrap;
+  struct bootstrapState *bootstrap;
   int localRank;        // intra-node rank index (computed from hostHash)
   int localRanks;       // number of ranks on this node
   int *localRankToRank; // mapping: local index -> global rank

@@ -73,7 +73,7 @@ const char *bootstrapAdaptorGetLastError(flagcxInnerComm_t comm) {
 flagcxResult_t bootstrapAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
                                             flagcxUniqueId_t /*commId*/,
                                             int rank,
-                                            bootstrapState *bootstrap) {
+                                            struct bootstrapState *bootstrap) {
   if (*comm == NULL) {
     FLAGCXCHECK(flagcxCalloc(comm, 1));
   }
@@ -142,7 +142,7 @@ flagcxResult_t bootstrapAdaptorCommSuspend(flagcxInnerComm_t comm) {
 
 flagcxResult_t bootstrapAdaptorCommCount(const flagcxInnerComm_t comm,
                                          int *count) {
-  *count = comm->base->nranks;
+  *count = bootstrapGetNranks(comm->base);
   return flagcxSuccess;
 }
 
@@ -154,7 +154,7 @@ flagcxResult_t bootstrapAdaptorCommCuDevice(const flagcxInnerComm_t comm,
 
 flagcxResult_t bootstrapAdaptorCommUserRank(const flagcxInnerComm_t comm,
                                             int *rank) {
-  *rank = comm->base->rank;
+  *rank = bootstrapGetRank(comm->base);
   return flagcxSuccess;
 }
 

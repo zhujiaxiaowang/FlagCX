@@ -85,15 +85,14 @@ const char *glooAdaptorGetLastError(flagcxInnerComm_t comm) {
 
 flagcxResult_t glooAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
                                        flagcxUniqueId_t /*commId*/, int rank,
-                                       bootstrapState *bootstrap) {
+                                       struct bootstrapState *bootstrap) {
   // Create gloo transport device
   std::shared_ptr<::gloo::transport::Device> dev;
-  flagcxNetProperties_t *properties =
-      (flagcxNetProperties_t *)bootstrap->properties;
+  flagcxNetProperties_t *properties = bootstrapGetNetProperties();
   if (flagcxParamGlooIbDisable() || flagcxParamTopoDetectionDisable()) {
     // Use transport tcp
     ::gloo::transport::tcp::attr attr;
-    attr.iface = std::string(bootstrap->bootstrapNetIfName);
+    attr.iface = std::string(bootstrapGetNetIfName());
     dev = ::gloo::transport::tcp::CreateDevice(attr);
   } else {
     // Use transport ibverbs

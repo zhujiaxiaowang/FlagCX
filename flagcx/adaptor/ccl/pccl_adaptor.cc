@@ -74,7 +74,7 @@ flagcxResult_t pcclAdaptorGetStagedBuffer(const flagcxInnerComm_t comm,
 // Communicator functions
 flagcxResult_t pcclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
                                        flagcxUniqueId_t commId, int rank,
-                                       bootstrapState * /*bootstrap*/) {
+                                       struct bootstrapState * /*bootstrap*/) {
   if (*comm == NULL) {
     flagcxCalloc(comm, 1);
   }

@@ -64,7 +64,7 @@ const char *cnclAdaptorGetLastError(flagcxInnerComm_t comm) {
 
 flagcxResult_t cnclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
                                        flagcxUniqueId_t commId, int rank,
-                                       bootstrapState * /*bootstrap*/) {
+                                       struct bootstrapState * /*bootstrap*/) {
   if (*comm == NULL) {
     flagcxCalloc(comm, 1);
   }

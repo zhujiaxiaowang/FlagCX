@@ -99,7 +99,7 @@ const char *tcclAdaptorGetLastError(flagcxInnerComm_t comm) {
 
 flagcxResult_t tcclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
                                        flagcxUniqueId_t commId, int rank,
-                                       bootstrapState * /*bootstrap*/) {
+                                       struct bootstrapState * /*bootstrap*/) {
   if (*comm == NULL) {
     flagcxCalloc(comm, 1);
   }
