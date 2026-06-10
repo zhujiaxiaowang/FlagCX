@@ -187,9 +187,18 @@ flagcxResult_t flagcxRegPool::registerBuffer(void *comm, void *data,
       }
       // Update regPool key to match new beginAddr
       auto &globalPool = regPool[GLOBAL_POOL_KEY];
-      auto node = globalPool.extract(oldBegin);
-      node.key() = beginAddr;
-      globalPool.insert(std::move(node));
+      auto nodeIt = globalPool.find(oldBegin);
+      if (nodeIt == globalPool.end()) {
+        WARN("registerBuffer: regPool key mismatch for oldBegin");
+        return flagcxInternalError;
+      }
+      std::unique_ptr<flagcxRegItem> tmp = std::move(nodeIt->second);
+      globalPool.erase(nodeIt);
+      if (globalPool.count(beginAddr)) {
+        WARN("registerBuffer: unexpected duplicate key at beginAddr");
+        return flagcxInternalError;
+      }
+      globalPool.emplace(beginAddr, std::move(tmp));
     }
     // Extend forward if new buffer goes beyond existing range
     if (endAddr > existing->endAddr) {
@@ -208,12 +217,12 @@ flagcxResult_t flagcxRegPool::registerBuffer(void *comm, void *data,
 
   // Not found: create new item in global pool
   auto &globalPool = regPool[GLOBAL_POOL_KEY];
-  auto reg = std::make_unique<flagcxRegItem>();
+  std::unique_ptr<flagcxRegItem> reg(new flagcxRegItem());
   reg->beginAddr = beginAddr;
   reg->endAddr = endAddr;
   reg->refCount = 1;
-  auto [it2, didInsert] = globalPool.emplace(beginAddr, std::move(reg));
-  flagcxRegItem *regPtr = it2->second.get();
+  auto result = globalPool.emplace(beginAddr, std::move(reg));
+  flagcxRegItem *regPtr = result.first->second.get();
 
   // Map pages in global regMap
   mapRegItemPages(GLOBAL_POOL_KEY, regPtr);

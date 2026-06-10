@@ -11,6 +11,7 @@
 #include <list>
 #include <map>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 // Max line length for reading xml
@@ -116,10 +117,26 @@ inline void serializeHeteroFunc(FILE *file, size_t chunksize,
   fprintf(file, "%*s</HeteroFunc>\n", indent, "");
 }
 
+// Overloaded dispatch helpers for serializeFunc2DVector (C++11-compatible
+// alternative to if constexpr)
+inline void serializeFunc(FILE *file, size_t chunksize,
+                          const flagcxC2cHomoFunc &func, int indent) {
+  serializeHomoFunc(file, chunksize, func, indent);
+}
+
+inline void serializeFunc(FILE *file, size_t chunksize,
+                          const flagcxC2cHeteroFunc &func, int indent) {
+  serializeHeteroFunc(file, chunksize, func, indent);
+}
+
 template <typename T>
 void serializeFunc2DVector(FILE *file, size_t chunksize,
                            const std::vector<std::vector<T>> &steps,
                            const char *tagName, int indent = 2) {
+  static_assert(std::is_same<T, flagcxC2cHomoFunc>::value ||
+                    std::is_same<T, flagcxC2cHeteroFunc>::value,
+                "serializeFunc2DVector only supports flagcxC2cHomoFunc or "
+                "flagcxC2cHeteroFunc");
   fprintf(file, "%*s<%s>\n", indent, "", tagName);
   for (const auto &stepVec : steps) {
     if (stepVec.size() == 0) {
@@ -128,20 +145,34 @@ void serializeFunc2DVector(FILE *file, size_t chunksize,
     }
     fprintf(file, "%*s<Step>\n", indent + 2, "");
     for (const auto &func : stepVec) {
-      if constexpr (std::is_same<T, flagcxC2cHomoFunc>::value) {
-        serializeHomoFunc(file, chunksize, func, indent + 4);
-      } else if constexpr (std::is_same<T, flagcxC2cHeteroFunc>::value) {
-        serializeHeteroFunc(file, chunksize, func, indent + 4);
-      }
+      serializeFunc(file, chunksize, func, indent + 4);
     }
     fprintf(file, "%*s</Step>\n", indent + 2, "");
   }
   fprintf(file, "%*s</%s>\n", indent, "", tagName);
 }
 
+// Overloaded dispatch helpers for readFunc2DVector (C++11-compatible
+// alternative to if constexpr)
+inline void readFuncStep(FILE *file, size_t chunksize, const char *line,
+                         std::vector<flagcxC2cHomoFunc> &step) {
+  if (strstr(line, "<HomoFunc>"))
+    step.emplace_back(file, chunksize);
+}
+
+inline void readFuncStep(FILE *file, size_t chunksize, const char *line,
+                         std::vector<flagcxC2cHeteroFunc> &step) {
+  if (strstr(line, "<HeteroFunc>"))
+    step.emplace_back(file, chunksize);
+}
+
 template <typename T>
 std::vector<std::vector<T>> readFunc2DVector(FILE *file, size_t chunksize,
                                              const char *tagName) {
+  static_assert(std::is_same<T, flagcxC2cHomoFunc>::value ||
+                    std::is_same<T, flagcxC2cHeteroFunc>::value,
+                "readFunc2DVector only supports flagcxC2cHomoFunc or "
+                "flagcxC2cHeteroFunc");
   std::vector<std::vector<T>> result;
   char line[LINE_LEN];
 
@@ -161,13 +192,7 @@ std::vector<std::vector<T>> readFunc2DVector(FILE *file, size_t chunksize,
       while (fgets(line, sizeof(line), file)) {
         if (strstr(line, "</Step>"))
           break;
-        if constexpr (std::is_same<T, flagcxC2cHomoFunc>::value) {
-          if (strstr(line, "<HomoFunc>"))
-            step.emplace_back(file, chunksize);
-        } else if constexpr (std::is_same<T, flagcxC2cHeteroFunc>::value) {
-          if (strstr(line, "<HeteroFunc>"))
-            step.emplace_back(file, chunksize);
-        }
+        readFuncStep(file, chunksize, line, step);
       }
       result.push_back(step);
     }
