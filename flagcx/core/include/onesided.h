@@ -13,8 +13,11 @@
 
 #include "comm.h" // for flagcxHeteroComm_t
 
+struct flagcxSymWindow; // forward declaration
+
 struct flagcxOneSideHandleInfo {
   uintptr_t *baseVas;
+  size_t regionSize; // size of the registered memory region (bytes)
   uint32_t *rkeys;
   uint32_t *lkeys;
   void *localMrHandle; // local rank's MR handle for deregMr
@@ -23,10 +26,21 @@ struct flagcxOneSideHandleInfo {
   void **fullSendComms; // [nRanks] per-peer sendComm (NULL if not owner)
   void **fullRecvComms; // [nRanks] per-peer recvComm (NULL if not owner)
   int nRanks;           // number of ranks (for cleanup iteration)
+
+  // Symmetric memory window for intra-node D2D bypass (CE path).
+  // NULL if VMM not available or window not registered with
+  // FLAGCX_WIN_COLL_SYMMETRIC.
+  struct flagcxSymWindow *symWin;
 };
 
 // Internal implementation used by sym_heap and flagcxCommRegister
 flagcxResult_t flagcxOneSideRegisterInternal(flagcxHeteroComm_t comm,
                                              void *buff, size_t size);
+
+// Build IPC peer pointer table for a user buffer (intra-node D2D bypass).
+// Stores results in comm->ipcTable and returns the table index.
+// Returns -1 on failure (IPC not available for this buffer).
+struct flagcxComm;
+int buildIpcPeerPointers(struct flagcxComm *comm, void *buff, size_t size);
 
 #endif // FLAGCX_ONESIDED_H_

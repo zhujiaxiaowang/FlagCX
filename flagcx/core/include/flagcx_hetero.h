@@ -33,6 +33,18 @@ struct flagcxRmaDesc {
   struct flagcxRmaDesc *next; // intrusive link for inProgressQueues
 };
 
+// Intra-node IPC state for direct D2D bypass (per-comm RMA proxy).
+// Initialized once at RMA proxy start, holds IPC-mapped peer buffer pointers.
+struct flagcxRmaIpcState {
+  int nRanks;
+  int *peerNodeIds;      // [nRanks] node ID of each peer
+  void ***peerDataBufs;  // [nRanks][oneSideHandleCount] IPC-mapped data buffers
+  void **peerSignalBufs; // [nRanks] IPC-mapped signal buffers
+  int dataHandleCount;   // number of registered data windows
+  uint64_t *signalSeqs; // [nRanks] per-peer accumulated signal counter (for D2D
+                        // signal writes)
+};
+
 // Per-comm async RMA proxy state.
 // pending queues: producer = caller (proxy kernel thread), consumer = progress
 // thread. inProgress queues: progress thread only (no locking needed).
@@ -50,6 +62,23 @@ struct flagcxRmaProxyState {
   volatile uint64_t *doneSeqs;  // [nRanks]
   volatile uint32_t *inFlights; // [nRanks]
 
+  // GPU-visible done sequence counters for STREAM_OPS mode.
+  // GPU stream waits on doneSeqsDev via streamWaitValue64.
+  uint64_t *doneSeqsDev; // [nRanks] device pointer (GPU-visible)
+  // CPU-side done sequence counters for HOST_FUNC mode.
+  // Written by proxy thread, polled by host-func callback.
+  volatile uint64_t *doneSeqsCpu; // [nRanks] host memory
+
+  // GPU-visible ready sequence counters for STREAM_OPS mode.
+  // GPU stream writes readySeqsDev via streamWriteValue64 to signal data ready.
+  uint64_t *readySeqsDev; // [nRanks] device pointer (GPU-visible)
+  // CPU-side ready sequence counters for HOST_FUNC mode.
+  // Written by host-func callback, polled by proxy thread.
+  volatile uint64_t *readySeqsCpu; // [nRanks] host memory
+
+  // Synchronization method: HOST_FUNC (default) or STREAM_OPS (opt-in via env)
+  int useStreamOps; // 0 = HOST_FUNC (default), 1 = STREAM_OPS
+
   // Global completion counter: incremented once for every op that completes.
   // Callers record the value before issuing ops, then poll until it advances.
   volatile uint64_t completionCount;
@@ -61,6 +90,17 @@ struct flagcxRmaProxyState {
   void *const *fullSendComms; // [nRanks] or NULL until published
   int nRanks;
   struct flagcxHeteroComm *comm; // back-pointer
+
+  // Intra-node IPC state: per-peer device pointers for D2D bypass
+  // NULL if not initialized or if no intra-node peers exist
+  struct flagcxRmaIpcState *ipcState;
+  bool ipcInitFailed; // true if IpcInit was attempted and failed (prevents
+                      // retries)
+
+  // Condition variable for HOST_FUNC done-wait: proxy thread broadcasts
+  // after updating doneSeqsCpu so host-func callbacks wake without spinning.
+  pthread_mutex_t doneMutex;
+  pthread_cond_t doneCond;
 
   pthread_t thread;
   volatile int stop;
@@ -100,7 +140,9 @@ flagcxResult_t flagcxHeteroCommDestroy(flagcxHeteroComm_t comm);
 
 flagcxResult_t flagcxHeteroPut(flagcxHeteroComm_t comm, int peer,
                                size_t srcOffset, size_t dstOffset, size_t size,
-                               int srcMrIdx, int dstMrIdx);
+                               int srcMrIdx, int dstMrIdx,
+                               bool streamSyncReady = false,
+                               uint64_t *assignedSeq = nullptr);
 
 flagcxResult_t flagcxHeteroBatchPut(flagcxHeteroComm_t comm, int peer,
                                     const size_t *srcOffsets,
@@ -120,7 +162,9 @@ flagcxResult_t flagcxHeteroPutSignal(flagcxHeteroComm_t comm, int peer,
                                      size_t srcOffset, size_t dstOffset,
                                      size_t size, size_t signalOffset,
                                      int srcMrIdx, int dstMrIdx,
-                                     uint64_t signalValue);
+                                     uint64_t signalValue,
+                                     bool streamSyncReady = false,
+                                     uint64_t *assignedSeq = nullptr);
 
 flagcxResult_t flagcxHeteroFlush(flagcxHeteroComm_t comm, void *gpuAddr,
                                  size_t size, void *gHandleInfo);
@@ -136,6 +180,11 @@ flagcxResult_t flagcxHeteroRmaProxyPublishSendComms(flagcxHeteroComm_t comm,
 // Wait until all ops for a specific peer up to seq are complete.
 flagcxResult_t flagcxHeteroFlushRma(flagcxHeteroComm_t comm, int peer,
                                     uint64_t seq);
+
+// Stream-based flush: enqueue a GPU-side wait on doneSeqsDev[peer] >= seq.
+// Returns immediately; the stream will stall until the condition is met.
+flagcxResult_t flagcxHeteroFlushRmaStream(flagcxHeteroComm_t comm, int peer,
+                                          uint64_t seq, flagcxStream_t stream);
 
 // Wait until all pending RMA ops for all peers are complete.
 flagcxResult_t flagcxHeteroFlushAllRma(flagcxHeteroComm_t comm);
@@ -159,5 +208,29 @@ flagcxResult_t flagcxHeteroReadCounter(flagcxHeteroComm_t comm,
 // before + N).
 flagcxResult_t flagcxHeteroWaitCounter(flagcxHeteroComm_t comm,
                                        uint64_t target);
+
+// Stream-based Put (with intra-node D2D bypass).
+// If peer is intra-node and IPC state is available, performs direct D2D memcpy
+// on the given stream. Otherwise enqueues to the proxy thread (same as
+// flagcxHeteroPut). Returns the opSeq for use with FlushRmaStream.
+flagcxResult_t flagcxHeteroPutStream(flagcxHeteroComm_t comm, int peer,
+                                     size_t srcOffset, size_t dstOffset,
+                                     size_t size, int srcMrIdx, int dstMrIdx,
+                                     flagcxStream_t stream, uint64_t *opSeq);
+
+// Stream-based PutSignal (with intra-node D2D bypass).
+flagcxResult_t
+flagcxHeteroPutSignalStream(flagcxHeteroComm_t comm, int peer, size_t srcOffset,
+                            size_t dstOffset, size_t size, size_t signalOffset,
+                            int srcMrIdx, int dstMrIdx, uint64_t signalValue,
+                            flagcxStream_t stream, uint64_t *opSeq);
+
+// Initialize IPC state for intra-node D2D bypass.
+// Must be called after one-sided handles are registered
+// (flagcxOneSideRegister). Collective: ALL intra-node ranks must call.
+flagcxResult_t flagcxHeteroRmaIpcInit(flagcxHeteroComm_t comm);
+
+// Cleanup IPC state.
+flagcxResult_t flagcxHeteroRmaIpcDestroy(flagcxHeteroComm_t comm);
 
 #endif
