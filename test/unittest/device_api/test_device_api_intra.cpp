@@ -1,56 +1,59 @@
 /*************************************************************************
  * Copyright (c) 2026 BAAI. All rights reserved.
  *
- * Device IR Intra-Node Tests — host driver exercising FlagCX Device API
- * IR wrapper functions that only require intra-node (single-node) setup.
+ * Intra-node Device API test — exercises struct-based Device API functions
+ * that only require single-node (intra-node) setup.
  *
- * Tests S-suffixed (scalar) IR functions (aligned with device_api_intra
- * K1–K10):
- *   S1:  Comm Queries (DevCommGetRank, DevCommGetSize,
- *DevCommGetIntraRank/Size) S2:  Coop Groups (CoopThreadRankS, CoopSizeS,
- *CoopSyncS, TileSpan, Lanes) S3:  Team Queries (TeamRankToWorldS) S4:  Local
- *Pointer (GetLocalPointerS) S5:  Intra Pointer (GetIntraPointerS) S6:  Peer
- *Pointer (GetPeerPointerS) S7:  Multicast Pointer (GetMulticastPointerS) —
- *commented, NVLS-dependent S8:  Intra Barrier Sync (IntraBarrierSyncS) S9:
- *Intra Barrier Sync Split (SyncS Release + read + SyncS Acquire) S10: Intra
- *AllReduce (composite using barriers + pointers)
+ * Tests (K1–K10, aligned with device_ir_intra S1–S10):
+ *   K1:  Comm Queries (hasWindow, getIntraRank/Size, getRank/Size)
+ *   K2:  Coop Groups (Block/Tile/Warp/Lanes/TileSpan threadRank/size/sync)
+ *   K3:  Team (flagcxTeamIntra, RankToWorld, RankToIntra, RankIsMember)
+ *   K4:  Local Pointer (flagcxGetLocalPointer, getRawPtr)
+ *   K5:  Intra Pointer (flagcxGetIntraPointer — IPC/window peer read)
+ *   K6:  Peer Pointer  (flagcxGetPeerPointer with team)
+ *   K7:  Multicast Pointer (flagcxGetMulticastPointer — commented, NVLS)
+ *   K8:  Intra Barrier Sync (flagcxDevBarrier<Intra> sync)
+ *   K9:  Intra Barrier Arrive/Wait (flagcxDevBarrier<Intra> arrive+wait)
+ *   K10: IntraAllReduce (composite — peer pointer + barrier end-to-end)
  *
- * Usage: mpirun -np N ./test_device_ir_intra [options]
- *   -b <minbytes>  -e <maxbytes>  -f <stepfactor>
+ * Usage: mpirun -np N ./test_device_api_intra [options]
+ *   -b <minbytes>  -e <maxbytes>  -f <stepfactor>  -R <regMode>
+ *   Runs on any single node, no network or HETERO_COMM required.
+ *   -R 2 recommended (window registration for peer pointer access).
  ************************************************************************/
 
-#include "device_ir.h"
+#include "device_api.h"
 #include "flagcx.h"
 #include "flagcx_kernel.h"
 #include "tools.h"
 
-#include <cassert>
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
-#include <iostream>
+#include <unistd.h>
 
-// ===========================================================================
-// Main test driver
-// ===========================================================================
+#define DATATYPE flagcxFloat
+
+static void printResult(const char *name, bool ok, int rank) {
+  printf("[rank %d] %-35s %s\n", rank, name, ok ? "PASS" : "FAIL");
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
   flagcxDeviceHandle_t devHandle;
-  FLAGCXCHECK(flagcxDeviceHandleInit(&devHandle));
   flagcxComm_t comm;
+  FLAGCXCHECK(flagcxDeviceHandleInit(&devHandle));
   flagcxUniqueId uniqueId;
 
+  int color = 0;
   int worldSize = 1, worldRank = 0;
   int totalProcs = 1, proc = 0;
-// Print with rank prefix from all ranks, flushing immediately
-#define RPRINTF(...)                                                           \
-  do {                                                                         \
-    printf("[rank %d] ", proc);                                                \
-    printf(__VA_ARGS__);                                                       \
-    fflush(stdout);                                                            \
-  } while (0)
   MPI_Comm splitComm;
   uint64_t splitMask = 0;
-  int color = 0;
   initMpiEnv(argc, argv, worldRank, worldSize, proc, totalProcs, color,
              splitComm, splitMask);
 
@@ -82,14 +85,14 @@ int main(int argc, char *argv[]) {
 
   // Create DevComm (initializes NVSHMEM — must precede nvshmem_malloc)
   flagcxDevCommRequirements reqs = FLAGCX_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  reqs.intraBarrierCount = 4;
-  reqs.interBarrierCount = 4;
-  reqs.interSignalCount = 2;
-  reqs.interCounterCount = 1;
+  reqs.intraBarrierCount = FLAGCX_DEVICE_CTA_COUNT;
+  reqs.interBarrierCount = 0;
+  reqs.interSignalCount = 0;
+  reqs.interCounterCount = 0;
   flagcxDevComm_t devComm = nullptr;
   FLAGCXCHECK(flagcxDevCommCreate(comm, &reqs, &devComm));
 
-  // Allocate test buffer sized to maxBytes
+  // Buffer sized to maxBytes, symmetric window registered
   size_t bufSize = maxBytes;
   void *regBuff = nullptr;
 #ifdef FLAGCX_COMM_TRAITS_SHMEM
@@ -99,7 +102,6 @@ int main(int argc, char *argv[]) {
 #endif
   FLAGCXCHECK(flagcxMemAlloc(&regBuff, bufSize, memAllocator));
 
-  // Register symmetric window
   flagcxWindow_t win = nullptr;
   FLAGCXCHECK(flagcxCommWindowRegister(
       comm, regBuff, bufSize, &win, FLAGCX_WIN_COLL_SYMMETRIC, memAllocator));
@@ -108,32 +110,27 @@ int main(int argc, char *argv[]) {
   flagcxDevMem_t devMem = nullptr;
   FLAGCXCHECK(flagcxDevMemCreate(comm, regBuff, bufSize, win, &devMem));
 
-  // Get device pointers
-  void *devCommPtr = nullptr;
-  FLAGCXCHECK(flagcxDevCommGetDevicePtr(devComm, &devCommPtr));
-  void *devMemPtr = nullptr;
-  FLAGCXCHECK(flagcxDevMemGetDevicePtr(devMem, &devMemPtr));
-
-  int peer = (proc + 1) % totalProcs;
-
-  // Allocate reusable device buffers
+  // Results buffer
   int *devResults = nullptr;
-  FLAGCXCHECK(devHandle->deviceMalloc((void **)&devResults, 16 * sizeof(int),
+  FLAGCXCHECK(devHandle->deviceMalloc((void **)&devResults, 64 * sizeof(int),
                                       flagcxMemDevice, NULL));
+  int hostResults[64] = {};
 
+  // Output buffer for pointer/barrier tests (sized to maxBytes)
   float *devOutput = nullptr;
   FLAGCXCHECK(devHandle->deviceMalloc((void **)&devOutput, bufSize,
                                       flagcxMemDevice, NULL));
 
-  // Host scratch buffer
+  // Host scratch buffer (reused across iterations)
   size_t maxCount = bufSize / sizeof(float);
   float *hostBuf = new float[maxCount];
 
   if (proc == 0) {
-    printf("# FlagCX Device IR Intra-Node Test\n");
+    printf("# FlagCX Device API Intra-Node Test\n");
     printf("# nRanks: %d\n#\n", totalProcs);
   }
 
+  int peer = (proc + 1) % totalProcs;
   bool allPass = true;
 
   // =========================================================================
@@ -150,61 +147,67 @@ int main(int argc, char *argv[]) {
     MPI_Barrier(MPI_COMM_WORLD);
 
     // -----------------------------------------------------------------------
-    // S1: Comm Queries (Scalar)
+    // K1: Comm Queries
     // -----------------------------------------------------------------------
+    FLAGCXCHECK(devHandle->deviceMemset(devResults, 0, 8 * sizeof(int),
+                                        flagcxMemDevice, stream));
+
+    FLAGCXCHECK(launchKernelCommQueries(devMem, devComm, devResults, stream));
+    FLAGCXCHECK(devHandle->streamSynchronize(stream));
+    FLAGCXCHECK(devHandle->deviceMemcpy(hostResults, devResults,
+                                        6 * sizeof(int),
+                                        flagcxMemcpyDeviceToHost, stream));
+
+    bool k1Ok = (hostResults[0] == 1) &&          // hasWindow
+                (hostResults[1] == proc) &&       // intraRank
+                (hostResults[2] == totalProcs) && // intraSize
+                (hostResults[3] == proc) &&       // rank
+                (hostResults[4] == totalProcs);   // size
+    printResult("K1 CommQueries", k1Ok, proc);
+    allPass &= k1Ok;
+
+    // -----------------------------------------------------------------------
+    // K2: Coop Groups
+    // -----------------------------------------------------------------------
+    MPI_Barrier(MPI_COMM_WORLD);
+    FLAGCXCHECK(devHandle->deviceMemset(devResults, 0, 16 * sizeof(int),
+                                        flagcxMemDevice, stream));
+
+    FLAGCXCHECK(launchKernelCoopGroups(devResults, stream));
+    FLAGCXCHECK(devHandle->streamSynchronize(stream));
+    FLAGCXCHECK(devHandle->deviceMemcpy(hostResults, devResults,
+                                        16 * sizeof(int),
+                                        flagcxMemcpyDeviceToHost, stream));
+
+    bool k2Ok = (hostResults[0] == 1) && (hostResults[1] == 1) &&
+                (hostResults[2] == 1) && (hostResults[3] == 1) &&
+                (hostResults[4] == 1);
+    printResult("K2 CoopGroups", k2Ok, proc);
+    allPass &= k2Ok;
+
+    // -----------------------------------------------------------------------
+    // K3: Team
+    // -----------------------------------------------------------------------
+    MPI_Barrier(MPI_COMM_WORLD);
+    FLAGCXCHECK(devHandle->deviceMemset(devResults, 0, 8 * sizeof(int),
+                                        flagcxMemDevice, stream));
+
+    FLAGCXCHECK(launchKernelTeam(devComm, devResults, stream));
+    FLAGCXCHECK(devHandle->streamSynchronize(stream));
+    FLAGCXCHECK(devHandle->deviceMemcpy(hostResults, devResults,
+                                        8 * sizeof(int),
+                                        flagcxMemcpyDeviceToHost, stream));
+
+    bool k3Ok = (hostResults[0] == 1) && (hostResults[1] == 1) &&
+                (hostResults[2] == 1) && (hostResults[3] == 1);
+    printResult("K3 Team", k3Ok, proc);
+    allPass &= k3Ok;
+
+    // -----------------------------------------------------------------------
+    // K4: Local Pointer
+    // -----------------------------------------------------------------------
+    MPI_Barrier(MPI_COMM_WORLD);
     FLAGCXCHECK(devHandle->deviceMemset(devResults, 0, 4 * sizeof(int),
-                                        flagcxMemDevice, stream));
-
-    launchKernelCommQueriesS(devCommPtr, devResults, stream);
-    FLAGCXCHECK(devHandle->streamSynchronize(stream));
-
-    int hostS1[4];
-    FLAGCXCHECK(devHandle->deviceMemcpy(hostS1, devResults, 4 * sizeof(int),
-                                        flagcxMemcpyDeviceToHost, stream));
-
-    bool s1Pass = (hostS1[0] == proc) && (hostS1[1] == totalProcs) &&
-                  (hostS1[2] == proc) && (hostS1[3] == totalProcs);
-    RPRINTF("S1  CommQueries(Scalar): %s\n", s1Pass ? "PASS" : "FAIL");
-    allPass &= s1Pass;
-
-    // -----------------------------------------------------------------------
-    // S2: Coop Groups (Scalar)
-    // -----------------------------------------------------------------------
-    FLAGCXCHECK(devHandle->deviceMemset(devResults, 0, 3 * sizeof(int),
-                                        flagcxMemDevice, stream));
-
-    launchKernelCoopGroupsS(devCommPtr, devResults, stream);
-    FLAGCXCHECK(devHandle->streamSynchronize(stream));
-
-    int hostS2[3];
-    FLAGCXCHECK(devHandle->deviceMemcpy(hostS2, devResults, 3 * sizeof(int),
-                                        flagcxMemcpyDeviceToHost, stream));
-
-    bool s2Pass = (hostS2[0] == 1) && (hostS2[1] == 1) && (hostS2[2] == 1);
-    RPRINTF("S2  CoopGroups(Scalar): %s\n", s2Pass ? "PASS" : "FAIL");
-    allPass &= s2Pass;
-
-    // -----------------------------------------------------------------------
-    // S3: Team Queries (Scalar)
-    // -----------------------------------------------------------------------
-    FLAGCXCHECK(devHandle->deviceMemset(devResults, 0, 2 * sizeof(int),
-                                        flagcxMemDevice, stream));
-
-    launchKernelTeamQueriesS(devCommPtr, devResults, stream);
-    FLAGCXCHECK(devHandle->streamSynchronize(stream));
-
-    int hostS3[2];
-    FLAGCXCHECK(devHandle->deviceMemcpy(hostS3, devResults, 2 * sizeof(int),
-                                        flagcxMemcpyDeviceToHost, stream));
-
-    bool s3Pass = (hostS3[1] == proc);
-    RPRINTF("S3  TeamQueries(Scalar): %s\n", s3Pass ? "PASS" : "FAIL");
-    allPass &= s3Pass;
-
-    // -----------------------------------------------------------------------
-    // S4: Local Pointer (Scalar)
-    // -----------------------------------------------------------------------
-    FLAGCXCHECK(devHandle->deviceMemset(devResults, 0, sizeof(int),
                                         flagcxMemDevice, stream));
 
     // Write a known value to regBuff so kernel can verify localPtr reads it
@@ -215,22 +218,24 @@ int main(int argc, char *argv[]) {
       FLAGCXCHECK(devHandle->streamSynchronize(stream));
     }
 
-    launchKernelLocalPointerS(devMemPtr, regBuff, devResults, stream);
+    FLAGCXCHECK(launchKernelLocalPointer(devMem, regBuff, devResults, stream));
     FLAGCXCHECK(devHandle->streamSynchronize(stream));
-
-    int hostS4 = 0;
-    FLAGCXCHECK(devHandle->deviceMemcpy(&hostS4, devResults, sizeof(int),
+    FLAGCXCHECK(devHandle->deviceMemcpy(hostResults, devResults,
+                                        4 * sizeof(int),
                                         flagcxMemcpyDeviceToHost, stream));
 
-    bool s4Pass = (hostS4 == 1);
-    RPRINTF("S4  LocalPointer(Scalar): %s\n", s4Pass ? "PASS" : "FAIL");
-    allPass &= s4Pass;
+    bool k4Ok = (hostResults[0] == 1);
+    printResult("K4 LocalPointer", k4Ok, proc);
+    allPass &= k4Ok;
 
     // -----------------------------------------------------------------------
-    // S5: Intra Pointer (Scalar)
+    // K5: Intra Pointer
     // -----------------------------------------------------------------------
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Write known pattern: each rank fills regBuff with its rank value
     for (size_t i = 0; i < count; i++)
-      hostBuf[i] = (float)(proc * 1000 + (int)i);
+      hostBuf[i] = (float)proc;
     FLAGCXCHECK(devHandle->deviceMemcpy(regBuff, hostBuf, count * sizeof(float),
                                         flagcxMemcpyHostToDevice, stream));
     FLAGCXCHECK(devHandle->streamSynchronize(stream));
@@ -239,31 +244,61 @@ int main(int argc, char *argv[]) {
     FLAGCXCHECK(devHandle->deviceMemset(devOutput, 0, count * sizeof(float),
                                         flagcxMemDevice, stream));
 
-    launchKernelIntraPointerS(devCommPtr, devMemPtr, devOutput, count, stream);
+    FLAGCXCHECK(
+        launchKernelIntraPointer(devMem, devComm, devOutput, count, stream));
     FLAGCXCHECK(devHandle->streamSynchronize(stream));
 
     FLAGCXCHECK(devHandle->deviceMemcpy(hostBuf, devOutput,
                                         count * sizeof(float),
                                         flagcxMemcpyDeviceToHost, stream));
-
-    bool s5Pass = true;
+    bool k5Ok = true;
     for (size_t i = 0; i < count; i++) {
-      float expected = (float)(peer * 1000 + (int)i);
-      if (fabsf(hostBuf[i] - expected) > 1e-3f) {
-        s5Pass = false;
+      if (fabsf(hostBuf[i] - (float)peer) > 1e-3f) {
+        k5Ok = false;
         break;
       }
     }
-    RPRINTF("S5  IntraPointer(Scalar): %s\n", s5Pass ? "PASS" : "FAIL");
-    allPass &= s5Pass;
+    printResult("K5 IntraPointer", k5Ok, proc);
+    allPass &= k5Ok;
 
+    // -----------------------------------------------------------------------
+    // K6: Peer Pointer (team-based)
+    // -----------------------------------------------------------------------
+    MPI_Barrier(MPI_COMM_WORLD);
+    FLAGCXCHECK(devHandle->deviceMemset(devOutput, 0, count * sizeof(float),
+                                        flagcxMemDevice, stream));
+
+    FLAGCXCHECK(
+        launchKernelPeerPointer(devMem, devComm, devOutput, count, stream));
+    FLAGCXCHECK(devHandle->streamSynchronize(stream));
+
+    FLAGCXCHECK(devHandle->deviceMemcpy(hostBuf, devOutput,
+                                        count * sizeof(float),
+                                        flagcxMemcpyDeviceToHost, stream));
+    bool k6Ok = true;
+    for (size_t i = 0; i < count; i++) {
+      if (fabsf(hostBuf[i] - (float)peer) > 1e-3f) {
+        k6Ok = false;
+        break;
+      }
+    }
+    printResult("K6 PeerPointer(team)", k6Ok, proc);
+    allPass &= k6Ok;
+
+    // -----------------------------------------------------------------------
+    // K7: Multicast Pointer (commented — NVLS-dependent)
+    // -----------------------------------------------------------------------
+    // MPI_Barrier(MPI_COMM_WORLD);
+    // ...
+
+    // -----------------------------------------------------------------------
+    // K8: Intra Barrier Sync
+    // -----------------------------------------------------------------------
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // -----------------------------------------------------------------------
-    // S6: Peer Pointer (Scalar) — team-based
-    // -----------------------------------------------------------------------
+    // Write rank+1 to local buffer
     for (size_t i = 0; i < count; i++)
-      hostBuf[i] = (float)(proc * 1000 + (int)i);
+      hostBuf[i] = (float)(proc + 1);
     FLAGCXCHECK(devHandle->deviceMemcpy(regBuff, hostBuf, count * sizeof(float),
                                         flagcxMemcpyHostToDevice, stream));
     FLAGCXCHECK(devHandle->streamSynchronize(stream));
@@ -272,92 +307,63 @@ int main(int argc, char *argv[]) {
     FLAGCXCHECK(devHandle->deviceMemset(devOutput, 0, count * sizeof(float),
                                         flagcxMemDevice, stream));
 
-    launchKernelPeerPointerS(devCommPtr, devMemPtr, devOutput, count, stream);
+    FLAGCXCHECK(launchKernelIntraBarrierSync(devMem, devComm, devOutput, count,
+                                             stream));
     FLAGCXCHECK(devHandle->streamSynchronize(stream));
 
     FLAGCXCHECK(devHandle->deviceMemcpy(hostBuf, devOutput,
                                         count * sizeof(float),
                                         flagcxMemcpyDeviceToHost, stream));
-
-    bool s6Pass = true;
+    bool k8Ok = true;
+    float k8Expected = (float)(peer + 1);
     for (size_t i = 0; i < count; i++) {
-      float expected = (float)(peer * 1000 + (int)i);
-      if (fabsf(hostBuf[i] - expected) > 1e-3f) {
-        s6Pass = false;
+      if (fabsf(hostBuf[i] - k8Expected) > 1e-3f) {
+        k8Ok = false;
         break;
       }
     }
-    RPRINTF("S6  PeerPointer(Scalar): %s\n", s6Pass ? "PASS" : "FAIL");
-    allPass &= s6Pass;
+    printResult("K8 IntraBarrierSync", k8Ok, proc);
+    allPass &= k8Ok;
 
+    // -----------------------------------------------------------------------
+    // K9: Intra Barrier Arrive/Wait
+    // -----------------------------------------------------------------------
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // -----------------------------------------------------------------------
-    // S7: Multicast Pointer (Scalar) — commented, NVLS-dependent
-    // -----------------------------------------------------------------------
+    // Write rank+100 to local buffer
+    for (size_t i = 0; i < count; i++)
+      hostBuf[i] = (float)(proc + 100);
+    FLAGCXCHECK(devHandle->deviceMemcpy(regBuff, hostBuf, count * sizeof(float),
+                                        flagcxMemcpyHostToDevice, stream));
+    FLAGCXCHECK(devHandle->streamSynchronize(stream));
+    MPI_Barrier(MPI_COMM_WORLD);
 
-    // -----------------------------------------------------------------------
-    // S8: Intra Barrier Sync (Scalar)
-    // -----------------------------------------------------------------------
-    FLAGCXCHECK(devHandle->deviceMemset(regBuff, 0, count * sizeof(float),
-                                        flagcxMemDevice, stream));
     FLAGCXCHECK(devHandle->deviceMemset(devOutput, 0, count * sizeof(float),
                                         flagcxMemDevice, stream));
 
-    launchKernelIntraBarrierSyncS(devCommPtr, devMemPtr, (float *)regBuff,
-                                  devOutput, count, stream);
+    FLAGCXCHECK(launchKernelIntraBarrierArriveWait(devMem, devComm, devOutput,
+                                                   count, stream));
     FLAGCXCHECK(devHandle->streamSynchronize(stream));
 
     FLAGCXCHECK(devHandle->deviceMemcpy(hostBuf, devOutput,
                                         count * sizeof(float),
                                         flagcxMemcpyDeviceToHost, stream));
-
-    float expectedS8 = (float)(peer + 1);
-    bool s8Pass = true;
+    bool k9Ok = true;
+    float k9Expected = (float)(peer + 100);
     for (size_t i = 0; i < count; i++) {
-      if (fabsf(hostBuf[i] - expectedS8) > 1e-3f) {
-        s8Pass = false;
+      if (fabsf(hostBuf[i] - k9Expected) > 1e-3f) {
+        k9Ok = false;
         break;
       }
     }
-    RPRINTF("S8  IntraBarrierSync(Scalar): %s\n", s8Pass ? "PASS" : "FAIL");
-    allPass &= s8Pass;
+    printResult("K9 IntraBarrierArriveWait", k9Ok, proc);
+    allPass &= k9Ok;
 
+    // -----------------------------------------------------------------------
+    // K10: IntraAllReduce (composite)
+    // -----------------------------------------------------------------------
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // -----------------------------------------------------------------------
-    // S9: Intra Barrier Arrive/Wait (Release + read + Acquire)
-    // -----------------------------------------------------------------------
-    FLAGCXCHECK(devHandle->deviceMemset(regBuff, 0, count * sizeof(float),
-                                        flagcxMemDevice, stream));
-    FLAGCXCHECK(devHandle->deviceMemset(devOutput, 0, count * sizeof(float),
-                                        flagcxMemDevice, stream));
-
-    launchKernelIntraBarrierArriveWaitS(devCommPtr, devMemPtr, (float *)regBuff,
-                                        devOutput, count, stream);
-    FLAGCXCHECK(devHandle->streamSynchronize(stream));
-
-    FLAGCXCHECK(devHandle->deviceMemcpy(hostBuf, devOutput,
-                                        count * sizeof(float),
-                                        flagcxMemcpyDeviceToHost, stream));
-
-    float expectedS9 = (float)(peer + 500);
-    bool s9Pass = true;
-    for (size_t i = 0; i < count; i++) {
-      if (fabsf(hostBuf[i] - expectedS9) > 1e-3f) {
-        s9Pass = false;
-        break;
-      }
-    }
-    RPRINTF("S9  IntraBarrierArriveWait(Scalar): %s\n",
-            s9Pass ? "PASS" : "FAIL");
-    allPass &= s9Pass;
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // -----------------------------------------------------------------------
-    // S10: Intra AllReduce (Scalar) — composite
-    // -----------------------------------------------------------------------
     for (size_t i = 0; i < count; i++)
       hostBuf[i] = (float)(proc + 1); // each rank contributes rank+1
     FLAGCXCHECK(devHandle->deviceMemcpy(regBuff, hostBuf, count * sizeof(float),
@@ -365,24 +371,23 @@ int main(int argc, char *argv[]) {
     FLAGCXCHECK(devHandle->streamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
-    launchKernelIntraAllReduceS(devCommPtr, devMemPtr, (float *)regBuff, count,
-                                stream);
+    FLAGCXCHECK(launchKernelIntraAllReduce(devMem, count, flagcxFloat, devComm,
+                                           stream));
     FLAGCXCHECK(devHandle->streamSynchronize(stream));
 
     FLAGCXCHECK(devHandle->deviceMemcpy(hostBuf, regBuff, count * sizeof(float),
                                         flagcxMemcpyDeviceToHost, stream));
-
     // AllReduce sum: expected = sum(1..N) = N*(N+1)/2
-    float expectedS10 = (float)(totalProcs * (totalProcs + 1) / 2);
-    bool s10Pass = true;
+    float k10Expected = (float)(totalProcs * (totalProcs + 1) / 2);
+    bool k10Ok = true;
     for (size_t i = 0; i < count; i++) {
-      if (fabsf(hostBuf[i] - expectedS10) > 1e-1f) {
-        s10Pass = false;
+      if (fabsf(hostBuf[i] - k10Expected) > 1e-1f) {
+        k10Ok = false;
         break;
       }
     }
-    RPRINTF("S10 IntraAllReduce(Scalar): %s\n", s10Pass ? "PASS" : "FAIL");
-    allPass &= s10Pass;
+    printResult("K10 IntraAllReduce(composite)", k10Ok, proc);
+    allPass &= k10Ok;
 
     if (proc == 0)
       printf("#\n");
@@ -405,8 +410,6 @@ int main(int argc, char *argv[]) {
   delete[] hostBuf;
   FLAGCXCHECK(devHandle->deviceFree(devOutput, flagcxMemDevice, NULL));
   FLAGCXCHECK(devHandle->deviceFree(devResults, flagcxMemDevice, NULL));
-  FLAGCXCHECK(flagcxDevMemFreeDevicePtr(devMem));
-  FLAGCXCHECK(flagcxDevCommFreeDevicePtr(devComm));
   FLAGCXCHECK(flagcxDevMemDestroy(comm, devMem));
   FLAGCXCHECK(flagcxCommWindowDeregister(comm, win, memAllocator));
   FLAGCXCHECK(flagcxMemFree(regBuff, memAllocator));

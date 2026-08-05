@@ -81,7 +81,9 @@ else ifeq ($(USE_ASCEND), 1)
 else ifeq ($(USE_METAX), 1)
   include $(PROJECT_ROOT)/makefiles/metax.mk
 else
-  $(error No platform selected. Set one of USE_NVIDIA=1, USE_DU=1, USE_ASCEND=1, USE_METAX=1, etc.)
+  ifneq ($(MAKECMDGOALS),clean)
+    $(error No platform selected. Set one of USE_NVIDIA=1, USE_DU=1, USE_ASCEND=1, USE_METAX=1, etc.)
+  endif
 endif
 
 # Test-specific overrides (format for compiler flags)
@@ -98,6 +100,7 @@ endif
 # SHMEM include path (used when USE_SHMEM=1)
 ifeq ($(USE_SHMEM), 1)
 SHMEM_INCLUDE := -I$(SHMEM_HOME)/include
+CXXFLAGS += -DFLAGCX_COMM_TRAITS_SHMEM
 else
 SHMEM_INCLUDE :=
 endif
