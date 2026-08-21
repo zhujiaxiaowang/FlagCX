@@ -29,6 +29,7 @@ ADAPTOR_MAP = {
     "tsm": "-DUSE_TSM_ADAPTOR",
     "enflame": "-DUSE_ENFLAME_ADAPTOR",
     "sunrise": "-DUSE_SUNRISE_ADAPTOR",
+    "ppu": "-DUSE_PPU_ADAPTOR",
 }
 
 # Adaptor name -> Make variable (for root setup.py make invocation)
@@ -45,6 +46,7 @@ ADAPTOR_TO_MAKE_FLAG = {
     "tsm": "USE_TSM",
     "enflame": "USE_ENFLAME",
     "sunrise": "USE_SUNRISE",
+    "ppu": "USE_PPU",
 }
 
 VALID_ADAPTORS = list(ADAPTOR_MAP.keys())
@@ -62,6 +64,7 @@ _PLATFORM_COMMANDS = [
     ("tsm_smi", "tsm"),
     ("efsmi", "enflame"),
     ("rocm-smi", "amd"),
+    ("ppu-smi", "ppu"),
     ("nvidia-smi", "nvidia"),
     ("pt-smi", "sunrise"),
 ]
@@ -179,6 +182,18 @@ def get_device_config(adaptor_flag):
         import torch_npu
         pytorch_npu_install_path = os.path.dirname(os.path.abspath(torch_npu.__file__))
         pytorch_library_path = os.path.join(pytorch_npu_install_path, "lib")
+        # CANN toolkit headers must come BEFORE torch_npu bundled third_party
+        # ACL headers (torch_npu 2.11.0 bundles newer ACL headers incompatible
+        # with CANN 8.5.1).  We also symlink torch_npu's third_party/acl/inc/acl
+        # to CANN's acl/ directory (see install.sh), but adding the CANN include
+        # path here is a belt-and-suspenders fix for hccl.h etc.
+        cann_home = os.environ.get("ASCEND_HOME_PATH", "")
+        if cann_home:
+            import platform as _pf
+            _arch = "aarch64-linux" if _pf.machine().startswith("aarch") else "x86_64-linux"
+            _cann_inc = os.path.join(cann_home, _arch, "include")
+            if os.path.isdir(_cann_inc):
+                include_dirs += [_cann_inc]
         include_dirs += [os.path.join(pytorch_npu_install_path, "include")]
         library_dirs += [pytorch_library_path]
         libs += ["torch_npu"]
@@ -212,9 +227,14 @@ def get_device_config(adaptor_flag):
         ]
         library_dirs += [
             torch_ptpu_dir,
+            os.path.join(tang_toolkit_dir, "lib"),
             os.path.join(tang_toolkit_dir, "lib", "linux-x86_64"),
         ]
         libs += [f":{c_so_basename}", "tangrt_shared"]
+    elif adaptor_flag == "-DUSE_PPU_ADAPTOR":
+        include_dirs += ["/usr/local/cuda/include"]
+        library_dirs += ["/usr/local/cuda/lib64"]
+        libs += ["cuda", "cudart", "c10_cuda", "torch_cuda"]
 
     return include_dirs, library_dirs, libs
 

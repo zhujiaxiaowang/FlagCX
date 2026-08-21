@@ -7,6 +7,9 @@
 #include "alloc.h"
 #include "comm.h"
 
+static_assert(sizeof(int) + sizeof(BKCLUniqueId) <= sizeof(flagcxInnerUniqueId),
+              "BKCLUniqueId does not fit inside flagcxInnerUniqueId");
+
 BKCLDataType flagcxToXcclDataType(flagcxDataType_t type) {
   // use BKCL_UINT8 as unknown data type
   static const struct {
@@ -45,6 +48,8 @@ BKCLOp flagcxRedOpToBKCLOp(flagcxRedOp_t op) {
       return BKCLOp::BKCL_MAX;
     case flagcxMin:
       return BKCLOp::BKCL_MIN;
+    case flagcxAvg:
+      return BKCLOp::BKCL_AVG;
     default:
       // return BKCLOp::BKCL_NUM_OPS to account for unknown redOp type
       return BKCLOp::BKCL_NUM_OPS;
@@ -56,7 +61,7 @@ flagcxResult_t xcclAdaptorGetVersion(int *version) {
   return flagcxNotSupported;
 }
 
-flagcxResult_t xcclAdaptorGetUniqueId(flagcxUniqueId_t *uniqueId) {
+flagcxResult_t xcclAdaptorGetUniqueId(flagcxInnerUniqueId_t *uniqueId) {
   if (*uniqueId == NULL) {
     flagcxCalloc(uniqueId, 1);
   }
@@ -83,7 +88,7 @@ const char *xcclAdaptorGetLastError(flagcxInnerComm_t comm) {
 }
 
 flagcxResult_t xcclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
-                                       flagcxUniqueId_t commId, int rank,
+                                       flagcxInnerUniqueId_t commId, int rank,
                                        struct bootstrapState * /*bootstrap*/) {
   if (*comm == NULL) {
     flagcxCalloc(comm, 1);

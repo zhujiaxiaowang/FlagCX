@@ -35,6 +35,16 @@ struct flagcxDeferredFree {
   int memType; // flagcxMemDevice, flagcxMemHost, etc.
 };
 
+// Deferred IPC entry — moved from ipcTable when a slot is released at runtime.
+// Actual ipcMemHandleClose + deviceFree happens at comm destroy.
+struct flagcxDeferredIpcEntry {
+  void **hostPeerPtrs;
+  void **devPeerPtrs;
+  int nPeers;
+  void *basePtr;
+  struct flagcxDeferredIpcEntry *next;
+};
+
 // Deferred DevComm buffer handle — buffers that cannot be freed immediately
 // in flagcxDevCommDestroy because peers may still hold IPC mappings to them.
 // Drained at flagcxCommDestroy time.
@@ -97,11 +107,9 @@ struct flagcxComm {
   std::map<struct TunerCollCategory, flagcxInnerComm_t>
       homoBestCommMap;              // key: commTag returned by tuner
   flagcxInnerComm_t tunerInnerComm; // innerComm selected by tuner
-  flagcxUniqueId_t commId;
-  flagcxUniqueId *uniqueIdData;
-  bool isTuningWithFlagscale; // whether tuning with flagscale
-  bool isTunningComm;         // whether tuning the communicator
-  bool isUseSingleTunerComm;  // whether tuning with one communicator
+  bool isTuningWithFlagscale;       // whether tuning with flagscale
+  bool isTunningComm;               // whether tuning the communicator
+  bool isUseSingleTunerComm;        // whether tuning with one communicator
   struct C2cSchedulePair {
     int sendCluster;
     int recvCluster;
@@ -109,6 +117,11 @@ struct flagcxComm {
 
   // IPC peer pointer table — deferred cleanup
   struct flagcxIpcTableEntry ipcTable[FLAGCX_MAX_IPC_ENTRIES];
+
+  // Deferred IPC entry queue — IPC resources moved here when slots are released
+  // at runtime; actual ipcMemHandleClose + deviceFree deferred to comm destroy.
+  flagcxIntruQueue<struct flagcxDeferredIpcEntry, &flagcxDeferredIpcEntry::next>
+      deferredIpcQueue;
 
   // Deferred DevComm buffer queue — buffers stashed here during
   // flagcxDevCommDestroy, drained at flagcxCommDestroy.
@@ -127,9 +140,7 @@ struct flagcxComm {
 
 // Function helps init single homo cluster.
 // return homoComm via homoComm parameter.
-flagcxResult_t flagcxHomoCommInit(flagcxUniqueId_t commId,
-                                  flagcxUniqueId *uniqueIdData,
-                                  struct bootstrapState *state,
+flagcxResult_t flagcxHomoCommInit(struct bootstrapState *state,
                                   flagcxComm_t comm,
                                   flagcxInnerComm_t *homoComm /*out*/);
 

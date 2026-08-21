@@ -7,6 +7,10 @@
 #include "comm.h"
 #include <map>
 #include <vector>
+
+static_assert(sizeof(HcclRootInfo) <= sizeof(flagcxInnerUniqueId),
+              "HcclRootInfo does not fit inside flagcxInnerUniqueId");
+
 std::map<flagcxDataType_t, HcclDataType> f2h_datatype_map = {
     {flagcxInt8, HCCL_DATA_TYPE_INT8},
     {flagcxUint8, HCCL_DATA_TYPE_UINT8},
@@ -68,13 +72,14 @@ struct HcclSendRecvItemEx {
 };
 HcclSendRecvItemEx item;
 std::vector<HcclSendRecvItem> sendRecvInfo;
+static int groupDepth = 0;
 
 // TODO: unsupported
 flagcxResult_t hcclAdaptorGetVersion(int *version) {
   return flagcxNotSupported;
 }
 
-flagcxResult_t hcclAdaptorGetUniqueId(flagcxUniqueId_t *uniqueId) {
+flagcxResult_t hcclAdaptorGetUniqueId(flagcxInnerUniqueId_t *uniqueId) {
   return (
       flagcxResult_t)h2f_ret_map[HcclGetRootInfo((HcclRootInfo *)(*uniqueId))];
 }
@@ -95,7 +100,7 @@ const char *hcclAdaptorGetLastError(flagcxInnerComm_t comm) {
 }
 
 flagcxResult_t hcclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
-                                       flagcxUniqueId_t commId, int rank,
+                                       flagcxInnerUniqueId_t commId, int rank,
                                        struct bootstrapState * /*bootstrap*/) {
   if (*comm == NULL) {
     flagcxCalloc(comm, 1);
@@ -307,34 +312,55 @@ flagcxResult_t hcclAdaptorSend(const void *sendbuff, size_t count,
                                flagcxDataType_t datatype, int peer,
                                flagcxInnerComm_t comm, flagcxStream_t stream) {
   void *sendbuffptr = (void *)sendbuff;
+  HcclDataType hcclDatatype = (HcclDataType)f2h_datatype_map[datatype];
+  if (groupDepth == 0) {
+    return (flagcxResult_t)
+        h2f_ret_map[HcclSend(sendbuffptr, count, hcclDatatype, (uint32_t)peer,
+                             comm->base, stream->base)];
+  }
+
   item.comm = comm;
   item.stream = stream;
-  sendRecvInfo.emplace_back(HcclSendRecvItem{
-      HcclSendRecvType::HCCL_SEND, sendbuffptr, count,
-      (HcclDataType)f2h_datatype_map[datatype], (uint32_t)peer});
+  sendRecvInfo.emplace_back(HcclSendRecvItem{HcclSendRecvType::HCCL_SEND,
+                                             sendbuffptr, count, hcclDatatype,
+                                             (uint32_t)peer});
   return flagcxSuccess;
 }
 
 flagcxResult_t hcclAdaptorRecv(void *recvbuff, size_t count,
                                flagcxDataType_t datatype, int peer,
                                flagcxInnerComm_t comm, flagcxStream_t stream) {
-  sendRecvInfo.emplace_back(HcclSendRecvItem{
-      HcclSendRecvType::HCCL_RECV, recvbuff, count,
-      (HcclDataType)f2h_datatype_map[datatype], (uint32_t)peer});
+  HcclDataType hcclDatatype = (HcclDataType)f2h_datatype_map[datatype];
+  if (groupDepth == 0) {
+    return (flagcxResult_t)
+        h2f_ret_map[HcclRecv(recvbuff, count, hcclDatatype, (uint32_t)peer,
+                             comm->base, stream->base)];
+  }
+
+  item.comm = comm;
+  item.stream = stream;
+  sendRecvInfo.emplace_back(HcclSendRecvItem{HcclSendRecvType::HCCL_RECV,
+                                             recvbuff, count, hcclDatatype,
+                                             (uint32_t)peer});
   return flagcxSuccess;
 }
 
 flagcxResult_t hcclAdaptorGroupStart() {
-  sendRecvInfo.clear();
+  if (groupDepth == 0) {
+    sendRecvInfo.clear();
+  }
+  groupDepth++;
   return flagcxSuccess;
 }
 
 flagcxResult_t hcclAdaptorGroupEnd() {
-  uint32_t itemNum = 0;
-  itemNum = sendRecvInfo.size();
-  if (itemNum > 0) {
-    return (flagcxResult_t)h2f_ret_map[HcclBatchSendRecv(
-        sendRecvInfo.data(), itemNum, item.comm->base, item.stream->base)];
+  groupDepth--;
+  if (groupDepth == 0) {
+    uint32_t itemNum = sendRecvInfo.size();
+    if (itemNum > 0) {
+      return (flagcxResult_t)h2f_ret_map[HcclBatchSendRecv(
+          sendRecvInfo.data(), itemNum, item.comm->base, item.stream->base)];
+    }
   }
   return flagcxSuccess;
 }

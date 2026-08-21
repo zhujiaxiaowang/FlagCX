@@ -6,16 +6,17 @@
  * Architecture:
  *   PlatformTraits<P>         — platform-level: Intrin, Atomic
  *   CommTraits<D>             — backend-level:  Window, Comm, Team, ...
- *   Default<PlatformTag>     — common IPC fallback (partial specialization)
+ *   DefaultBackend<PlatformTag> — common IPC fallback (partial specialization)
  *
  * CommTraits pulls in platform capabilities via using-aliases (not
  * inheritance). Vendor specializations wrap vendor types with member
- * functions. The Default partial specialization provides IPC-based
+ * functions. The DefaultBackend partial specialization provides IPC-based
  * types that work with any platform.
  *
  * Selection:
- *   NVIDIA + NCCL > 2.28:    DeviceAPI = CommTraits<NvidiaVendor>
- *   NVIDIA + fallback:       DeviceAPI = CommTraits<Default<NvidiaPlatform>>
+ *   NVIDIA + NCCL > 2.28:    DeviceAPI = CommTraits<NcclBackend>
+ *   NVIDIA + fallback:       DeviceAPI =
+ *CommTraits<DefaultBackend<NvidiaPlatform>>
  *
  * Kernel code uses DeviceAPI::* exclusively, no #ifdef branches.
  ************************************************************************/
@@ -23,35 +24,41 @@
 #ifndef FLAGCX_COMM_TRAITS_H_
 #define FLAGCX_COMM_TRAITS_H_
 
+#include "flagcx_device_enums.h"
 #include "platform_traits.h"
 #include <cstddef>
 #include <cstdint>
 
-// Primary template — each backend provides a specialization
+// Primary template — each backend provides a specialization.  Unified IR uses
+// only this backend-neutral contract:
+//   Comm: getRank(), getIntraRank(), getIntraSize(),
+//         usesDirectP2pSignals(), isOneSidedTransportReady(),
+//         supportsDirectCounterAccess().
+//   Net:  getContextId(), getSignalPtr(), getPeerSignalPtr(),
+//         getSignalShadowPtr(), getCounterPtr().
+// The IR layer must not inspect backend storage fields or derive slot offsets.
 template <typename Impl>
 struct CommTraits;
 
-// Default tag — parameterized by platform for the partial specialization
+// DefaultBackend tag — parameterized by platform for the partial specialization
 template <typename PlatformTag>
-struct Default {};
+struct DefaultBackend {};
 
 // ============================================================
 // Action types for one-sided operations (needed by traits Net types).
 // Pure POD structs with no device builtins.
 // ============================================================
-typedef uint32_t flagcxDevNetSignal_t;
-typedef uint32_t flagcxDevNetCounter_t;
 
 struct flagcxDevNet_None {};
 struct flagcxDevNet_SignalInc {
-  flagcxDevNetSignal_t signal;
+  flagcxDevSignal_t signal;
 };
 struct flagcxDevNet_SignalAdd {
-  flagcxDevNetSignal_t signal;
+  flagcxDevSignal_t signal;
   uint64_t value;
 };
 struct flagcxDevNet_CounterInc {
-  flagcxDevNetCounter_t counter;
+  flagcxDevCounter_t counter;
 };
 
 // Shared memory descriptor for NIC descriptor optimization.
@@ -89,7 +96,7 @@ struct Barrier;
 #include "sunrise_comm_traits.h"
 #else
 #include "default_comm_traits.h"
-using DeviceAPI = CommTraits<Default<DefaultPlatform>>;
+using DeviceAPI = CommTraits<DefaultBackend<DefaultPlatform>>;
 #endif
 
 #endif // FLAGCX_COMM_TRAITS_H_

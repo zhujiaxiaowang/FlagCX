@@ -17,7 +17,6 @@
 #include <cstring>
 #include <stddef.h>
 #include <stdint.h>
-#include <string>
 #include <vector>
 
 /* ------------------------------------------------------------------ */
@@ -126,7 +125,6 @@ struct FlagcxSlice {
   uint32_t lkey = 0;
   uint32_t rkey = 0;
   uint8_t opcode = FLAGCX_SLICE_OP_WRITE;
-  std::string peerNicPath;
   FlagcxTransferTask *task = nullptr;
   volatile int *qpDepth = nullptr;
 
@@ -414,12 +412,12 @@ int flagcxP2pEngineWrite(FlagcxP2pConn *conn, FlagcxP2pMr mr, const void *data,
  * @return              0 on success, non-zero on failure.
  */
 int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
-                               std::vector<FlagcxP2pMr> mrIds,
-                               std::vector<void *> dstVec,
-                               std::vector<size_t> sizeVec,
-                               std::vector<FlagcxP2pRdmaDesc> descs,
+                               const std::vector<FlagcxP2pMr> &mrIds,
+                               const std::vector<void *> &dstVec,
+                               const std::vector<size_t> &sizeVec,
+                               const std::vector<FlagcxP2pRdmaDesc> &descs,
                                int numIovs, uint64_t *transferId,
-                               std::vector<char *> ipcBufs = {});
+                               const std::vector<char *> &ipcBufs = {});
 
 /**
  * Blocking vectored write. Submits a WriteVector and polls completion via
@@ -434,10 +432,10 @@ int flagcxP2pEngineWriteVector(FlagcxP2pConn *conn,
  * @return              0 on success, non-zero on failure.
  */
 int flagcxP2pEngineWriteVectorSync(FlagcxP2pConn *conn,
-                                   std::vector<FlagcxP2pMr> mrIds,
-                                   std::vector<void *> srcVec,
-                                   std::vector<size_t> sizeVec,
-                                   std::vector<FlagcxP2pRdmaDesc> descs);
+                                   const std::vector<FlagcxP2pMr> &mrIds,
+                                   const std::vector<void *> &srcVec,
+                                   const std::vector<size_t> &sizeVec,
+                                   const std::vector<FlagcxP2pRdmaDesc> &descs);
 
 /* ================================================================== */
 /*  Two-sided send / recv                                             */
@@ -619,6 +617,12 @@ int flagcxP2pRpcStartServer(void *engine);
 /* Register a buffer for RDMA. Writes the MR handle to *mrIdOut. */
 int flagcxP2pRpcRegister(void *engine, uint64_t addr, uint64_t size,
                          uint64_t *mrIdOut);
+
+/* Same interface as flagcxP2pRpcRegister, but on chips/adaptors whose runtime
+   cannot reset the current error state, this host entry avoids producing the
+   error at all. */
+int flagcxP2pRpcRegisterHost(void *engine, uint64_t addr, uint64_t size,
+                             uint64_t *mrIdOut);
 
 /* Get (or lazily establish) a cached connection to "host:port". */
 void *flagcxP2pRpcGetConn(void *engine, const char *session);
