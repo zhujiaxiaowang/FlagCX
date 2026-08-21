@@ -648,9 +648,8 @@ flagcxResult_t macaAdaptorSymMulticastBind(void *mcHandle, int importFd,
   accessDesc.location.type = mcMemLocationTypeDevice;
   accessDesc.location.id = macaDev;
   accessDesc.flags = mcMemAccessFlagsProtReadWrite;
-  res = mcMemSetAccess(mcVa, alignedSize, &accessDesc, 1);
   if (res != mcSuccess) {
-    WARN("symMulticastBind: cuMemSetAccess failed: %d", res);
+    WARN("symMulticastBind: mcMemSetAccess failed: %d", res);
     mcMemUnmap(mcVa, alignedSize);
     mcMemAddressFree(mcVa, alignedSize);
     if (imported)
